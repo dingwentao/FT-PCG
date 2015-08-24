@@ -58,7 +58,7 @@ PetscErrorCode KSPSetUp_CG(KSP ksp)
   KSP_CG         *cgP = (KSP_CG*)ksp->data;
   PetscErrorCode ierr;
   /* Dingwen */
-  PetscInt			 maxit = ksp->max_it,nwork = 4; /* add CKSAmat */
+  PetscInt			 maxit = ksp->max_it,nwork = 6; /* add predefined vectors C1,C2 and checksum(A) CKSAmat */
   //  PetscInt       maxit = ksp->max_it,nwork = 3;
 
   PetscFunctionBegin;
@@ -102,13 +102,15 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
   KSP_CG         *cg;
   Mat            Amat,Pmat;
   PetscBool      diagonalscale;
-/* Dingwen */
-  PetscScalar	 CKSX, CKSZ, CKSR, CKSP, CKSS, CKSW;
-  Vec			 CKSAmat;
-  Vec			 C1;
-  PetscScalar	 d1;
-/* Dingwen */  
-  
+  /* Dingwen */
+  PetscScalar	CKSX, CKSZ, CKSR, CKSP, CKSS, CKSW;
+  Vec			CKSAmat;
+  Vec			C1;
+//  Vec			C2;
+  PetscScalar	d1;
+//  PetscScalar	d2;
+  PetscScalar	sumX,sumR;
+  /* Dingwen */
   PetscFunctionBegin;
   ierr = PCGetDiagonalScale(ksp->pc,&diagonalscale);CHKERRQ(ierr);
   if (diagonalscale) SETERRQ1(PetscObjectComm((PetscObject)ksp),PETSC_ERR_SUP,"Krylov method %s does not support diagonal scaling",((PetscObject)ksp)->type_name);
@@ -128,10 +130,14 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
     S = ksp->work[3];
     W = ksp->work[4];
 	CKSAmat = ksp->work[5];
+	C1 = ksp->work[6];
+//	C2 = ksp->work[7];
   } else {
     S = 0;                      /* unused */
     W = Z;
 	CKSAmat = ksp->work[3];
+	C1 = ksp->work[4];
+//	C2 = ksp->work[5];
   }
     
   if (eigs) {e = cg->e; d = cg->d; e[0] = 0.0; }
@@ -145,9 +151,19 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
     ierr = VecCopy(B,R);CHKERRQ(ierr);                         /*     r <- b (x is 0) */
   }
   
+  /* Dingwen */	
+  /* checksum coefficients initialization */
+  PetscInt v;
+  for (i=0; i<4; i++)
+  {
+	  v	 	= 1;
+	  ierr	= VecSetValues(C1,1,&i,&v,INSERT_VALUES);CHKERRQ(ierr);
+//	  v		= i;
+//	  ierr 	= VecSetValues(C2,1,&i,&v,INSERT_VALUES);CHKERRQ(ierr);
+  }
+  d1 = 1.0;
+//d2 = 2.0;
   /* Dingwen */
-  ierr = KSPGetChecksumCoefficients(ksp,&C1, &d1);
-  /* Diingwen */
 
   switch (ksp->normtype) {
   case KSP_NORM_PRECONDITIONED:
@@ -223,7 +239,7 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
       ierr = VecCopy(Z,P);CHKERRQ(ierr);         /*     p <- z          */
       b    = 0.0;
 	  /* Dingwen */
-	  ierr = VecXDot(C1,P, &CKSP);CHKERRQ(ierr);  					/* Compute the initial checksum(P) */
+	  ierr = VecXDot(C1,P, &CKSP);CHKERRQ(ierr);  				/* Compute the initial checksum(P) */
 	  /* Dingwen */
     } else {
       b = beta/betaold;
@@ -233,7 +249,7 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
       }
       ierr = VecAYPX(P,b,Z);CHKERRQ(ierr);    /*     p <- z + b* p   */
 	  /* Dingwen */
-	  CKSP = CKSZ + b*CKSP;											/* Update checksum(P) = checksum(Z) + b*checksum(P); */
+	  CKSP = CKSZ + b*CKSP;										/* Update checksum(P) = checksum(Z) + b*checksum(P); */
 	  /* Dingwen */
     }
     dpiold = dpi;
@@ -243,7 +259,7 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
 	  
 	  /* Dingwen */
 	  ierr = VecXDot(CKSAmat, P, &CKSW);CHKERRQ(ierr);
-	  CKSW = CKSW + d1*CKSP;										/* Update checksum(W) = checksum(A)P + d1*checksum(P); */
+	  CKSW = CKSW + d1*CKSP;									/* Update checksum(W) = checksum(A)P + d1*checksum(P); */
 	  /* Dingwen */
 
     } else {
@@ -251,7 +267,7 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
       dpi  = delta - beta*beta*dpiold/(betaold*betaold);             /*     dpi <- p'w     */
 	  
 	  /* Dingwen */
-	  CKSW = beta/betaold*CKSW + CKSS;								/* Update checksum(W) = checksum(S) + beta/betaold*checksum(W); */
+	  CKSW = beta/betaold*CKSW + CKSS;							/* Update checksum(W) = checksum(S) + beta/betaold*checksum(W); */
 	  /* Dingwen */
 	
 	}
@@ -268,13 +284,13 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
     ierr = VecAXPY(X,a,P);CHKERRQ(ierr);          /*     x <- x + ap     */
 	
 	/* Dingwen */
-	CKSX = CKSX + a*CKSP;							/* Update checksum(X) = checksum(X) + a*checksum(P); */
+	CKSX = CKSX + a*CKSP;									/* Update checksum(X) = checksum(X) + a*checksum(P); */
 	/* Dingwen */
     
 	ierr = VecAXPY(R,-a,W);CHKERRQ(ierr);                      /*     r <- r - aw    */
     
 	/* Dingwen */
-	CKSR = CKSR - a*CKSW;							/* Update checksum(R) = checksum(R) - a*checksum(W); */
+	CKSR = CKSR - a*CKSW;									/* Update checksum(R) = checksum(R) - a*checksum(W); */
 	/* Dingwen */
 	
 	if (ksp->normtype == KSP_NORM_PRECONDITIONED && ksp->chknorm < i+2) {
@@ -351,9 +367,11 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
     i++;
   } while (i<ksp->max_it);
   /* Dingwen */
-  VecView(X,0);
+  ierr = VecXDot(C1,X,&sumX);CHKERRQ(ierr);
+  ierr = VecXDot(C1,R,&sumR);CHKERRQ(ierr);
+  printf ("\nsum of X = %f\n", sumX);
   printf ("\nchecksum(X) = %f\n", CKSX);
-  VecView(R,0);
+  printf ("\nsum of X = %f\n", sumR);
   printf ("\nchecksum(R) = %f\n", CKSR);
   /* Dingwen */
   if (i >= ksp->max_it) ksp->reason = KSP_DIVERGED_ITS;
