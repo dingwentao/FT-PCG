@@ -58,7 +58,7 @@ PetscErrorCode KSPSetUp_CG(KSP ksp)
   KSP_CG         *cgP = (KSP_CG*)ksp->data;
   PetscErrorCode ierr;
   /* Dingwen */
-  PetscInt			 maxit = ksp->max_it,nwork = 6; /* add predefined vectors C1,C2 and checksum(A) CKSAmat */
+  PetscInt			 maxit = ksp->max_it,nwork = 8; /* add predefined vectors C1,C2, checksum(A) CKSAmat and checkpoint vectors CKPX,CKPP */
   //  PetscInt       maxit = ksp->max_it,nwork = 3;
 
   PetscFunctionBegin;
@@ -103,13 +103,16 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
   Mat            Amat,Pmat;
   PetscBool      diagonalscale;
   /* Dingwen */
-  PetscScalar	CKSX, CKSZ, CKSR, CKSP, CKSS, CKSW;
+  PetscInt		itv_d, itv_c;
+  PetscScalar	CKSX,CKSZ,CKSR,CKSP,CKSS,CKSW;
   Vec			CKSAmat;
-  Vec			C1;
-//  Vec			C2;
-  PetscScalar	d1;
-//  PetscScalar	d2;
+  Vec			C1,C2;
+  PetscScalar	d1,d2;
   PetscScalar	sumX,sumR;
+  Vec			CKPX,CKPP;
+  PetscScalar	CKPbetaold;
+  PetscInt		CKPi;
+  PetscBool		flag = PETSC_TRUE;
   /* Dingwen */
   PetscFunctionBegin;
   ierr = PCGetDiagonalScale(ksp->pc,&diagonalscale);CHKERRQ(ierr);
@@ -123,21 +126,22 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
   R             = ksp->work[0];
   Z             = ksp->work[1];
   P             = ksp->work[2];
+  /* Dingwen */
+  CKPX			= ksp->work[3];
+  CKPP			= ksp->work[4];
+  CKSAmat		= ksp->work[5];
+  C1			= ksp->work[6];
+  C2			= ksp->work[7];
+  /* Dingwen */
   
   #define VecXDot(x,y,a) (((cg->type) == (KSP_CG_HERMITIAN)) ? VecDot(x,y,a) : VecTDot(x,y,a))
 
   if (cg->singlereduction) {
-    S = ksp->work[3];
-    W = ksp->work[4];
-	CKSAmat = ksp->work[5];
-	C1 = ksp->work[6];
-//	C2 = ksp->work[7];
+    S = ksp->work[8];
+    W = ksp->work[9];
   } else {
     S = 0;                      /* unused */
     W = Z;
-	CKSAmat = ksp->work[3];
-	C1 = ksp->work[4];
-//	C2 = ksp->work[5];
   }
     
   if (eigs) {e = cg->e; d = cg->d; e[0] = 0.0; }
@@ -151,18 +155,19 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
     ierr = VecCopy(B,R);CHKERRQ(ierr);                         /*     r <- b (x is 0) */
   }
   
+
   /* Dingwen */	
   /* checksum coefficients initialization */
-  PetscInt v;
+  PetscScalar v;
   for (i=0; i<4; i++)
   {
 	  v	 	= 1;
 	  ierr	= VecSetValues(C1,1,&i,&v,INSERT_VALUES);CHKERRQ(ierr);
-//	  v		= i;
-//	  ierr 	= VecSetValues(C2,1,&i,&v,INSERT_VALUES);CHKERRQ(ierr);
+	  v		= i;
+	  ierr 	= VecSetValues(C2,1,&i,&v,INSERT_VALUES);CHKERRQ(ierr);
   }
   d1 = 1.0;
-//d2 = 2.0;
+  d2 = 2.0;
   /* Dingwen */
 
   switch (ksp->normtype) {
@@ -213,18 +218,59 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
 
   /* Dingwen */
   /* Checksum Initialization */
-  ierr = VecDot(C1,X,&CKSX);CHKERRQ(ierr);						/* Compute the initial checksum(X) */ 
+  ierr = VecXDot(C1,X,&CKSX);CHKERRQ(ierr);						/* Compute the initial checksum(X) */ 
   ierr = VecXDot(C1,W,&CKSW);CHKERRQ(ierr);						/* Compute the initial checksum(W) */
   ierr = VecXDot(C1,R,&CKSR);CHKERRQ(ierr);						/* Compute the initial checksum(R) */
   ierr = VecXDot(C1,Z,&CKSZ);CHKERRQ(ierr);						/* Compute the initial checksum(Z) */
   ierr = KSP_MatMultTranspose(ksp,Amat,C1,CKSAmat);CHKERRQ(ierr);
   ierr = VecAXPY(CKSAmat,-d1,C1);CHKERRQ(ierr);					/* Compute the initial checksum(A) */
+  itv_c = 2;
+  itv_d = 1;
   /* Dingwen */
   
   i = 0;
   do {
-    ksp->its = i+1;
-    if (beta == 0.0) {
+	  /* Dingwen */
+	  if ((i>0) && (i%itv_d == 0))
+	  {
+		  ierr = VecXDot(C1,X,&sumX);CHKERRQ(ierr);
+		  ierr = VecXDot(C1,R,&sumR);CHKERRQ(ierr);
+		  if ((PetscAbsScalar(sumX-CKSX) > 1.0e-10) || (PetscAbsScalar(sumR-CKSR) > 1.0e-10))
+		  {
+			  /* Rollback and Recovery */
+			  printf ("Recovery start...\n");
+			  printf ("Rollback from iteration-%d to iteration-%d\n",i,CKPi);
+			  betaold = CKPbetaold;										/* Recovery scalar betaold by checkpoint*/
+			  i = CKPi;													/* Recovery integer i by checkpoint */
+			  ierr = VecCopy(CKPP,P);CHKERRQ(ierr);						/* Recovery vector P from checkpoint */
+			  ierr = VecXDot(C1,P,&CKSP);CHKERRQ(ierr);					/* Recovery checksum(P) by P */ 
+			  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);				/* Recovery vector W by P */
+			  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);				/* Recovery vector W by P */
+			  ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);						/* Recovery scalar dpi by P and W */
+			  ierr = VecCopy(CKPX,X);CHKERRQ(ierr);						/* Recovery vector X from checkpoint */
+			  ierr = VecXDot(C1,X,&CKSX);CHKERRQ(ierr);					/* Recovery checksum(X) by X */ 
+			  ierr = KSP_MatMult(ksp,Amat,X,R);CHKERRQ(ierr);				/* Recovery vector R by X */
+			  ierr = VecAYPX(R,-1.0,B);CHKERRQ(ierr);
+			  ierr = VecXDot(C1,R,&CKSR);CHKERRQ(ierr);					/* Recovery checksum(R) by R */
+			  ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);					/* Recovery vector Z by R */
+			  ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);					/* Recovery vector Z by R */
+			  ierr = VecXDot(C1,Z,&CKSZ);CHKERRQ(ierr);					/* Recovery checksum(Z) by Z */
+			  ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);					/* Recovery scalar beta by Z and R */
+			  printf ("Recovery end.\n");
+		}
+		else if (i%(itv_c*itv_d) == 0)
+		{
+			printf ("Checkpointing start...\n");
+			printf ("Checkpoint iteration-%d\n",i);
+			ierr = VecCopy(X,CKPX);CHKERRQ(ierr);
+			ierr = VecCopy(P,CKPP);CHKERRQ(ierr);
+			CKPbetaold = betaold;
+			CKPi = i;
+			printf ("Checkpointing end.\n");
+		}
+	}
+	  ksp->its = i+1;
+	  if (beta == 0.0) {
       ksp->reason = KSP_CONVERGED_ATOL;
       ierr        = PetscInfo(ksp,"converged due to beta = 0\n");CHKERRQ(ierr);
       break;
@@ -247,7 +293,7 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
         if (ksp->max_it != stored_max_it) SETERRQ(PetscObjectComm((PetscObject)ksp),PETSC_ERR_SUP,"Can not change maxit AND calculate eigenvalues");
         e[i] = PetscSqrtReal(PetscAbsScalar(b))/a;
       }
-      ierr = VecAYPX(P,b,Z);CHKERRQ(ierr);    /*     p <- z + b* p   */
+      ierr = VecAYPX(P,b,Z);CHKERRQ(ierr);    /*     p <- z + b* p   */	  
 	  /* Dingwen */
 	  CKSP = CKSZ + b*CKSP;										/* Update checksum(P) = checksum(Z) + b*checksum(P); */
 	  /* Dingwen */
@@ -255,21 +301,17 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
     dpiold = dpi;
     if (!cg->singlereduction || !i) {
       ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);          /*     w <- Ap         */	/* MVM */
-      ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);                  /*     dpi <- p'w     */
-	  
+      ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);                  /*     dpi <- p'w     */	  
 	  /* Dingwen */
 	  ierr = VecXDot(CKSAmat, P, &CKSW);CHKERRQ(ierr);
 	  CKSW = CKSW + d1*CKSP;									/* Update checksum(W) = checksum(A)P + d1*checksum(P); */
 	  /* Dingwen */
-
     } else {
       ierr = VecAYPX(W,beta/betaold,S);CHKERRQ(ierr);                  /*     w <- Ap         */
       dpi  = delta - beta*beta*dpiold/(betaold*betaold);             /*     dpi <- p'w     */
-	  
 	  /* Dingwen */
 	  CKSW = beta/betaold*CKSW + CKSS;							/* Update checksum(W) = checksum(S) + beta/betaold*checksum(W); */
 	  /* Dingwen */
-	
 	}
     betaold = beta;
     KSPCheckDot(ksp,beta);
@@ -282,39 +324,36 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
     a = beta/dpi;                                 /*     a = beta/p'w   */
     if (eigs) d[i] = PetscSqrtReal(PetscAbsScalar(b))*e[i] + 1.0/a;
     ierr = VecAXPY(X,a,P);CHKERRQ(ierr);          /*     x <- x + ap     */
-	
 	/* Dingwen */
 	CKSX = CKSX + a*CKSP;									/* Update checksum(X) = checksum(X) + a*checksum(P); */
 	/* Dingwen */
     
 	ierr = VecAXPY(R,-a,W);CHKERRQ(ierr);                      /*     r <- r - aw    */
-    
+
 	/* Dingwen */
 	CKSR = CKSR - a*CKSW;									/* Update checksum(R) = checksum(R) - a*checksum(W); */
 	/* Dingwen */
 	
-	if (ksp->normtype == KSP_NORM_PRECONDITIONED && ksp->chknorm < i+2) {
-      ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);               /*     z <- Br         */
-      
+	if (ksp->normtype == KSP_NORM_PRECONDITIONED && ksp->chknorm < i+2) {      
+	  ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);               /*     z <- Br         */
+	  
 	  /* Dingwen */
 	  ierr = VecXDot(C1,Z, &CKSZ);CHKERRQ(ierr);				/* Update checksum(Z) */
 	  /* Dingwen */
 	  
 	  if (cg->singlereduction) {
         ierr = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);			/* MVM */
-		
 		/* Dingwen */
 		ierr = VecXDot(CKSAmat, Z, &CKSS);CHKERRQ(ierr);
 		CKSS = CKSS + d1*CKSZ;									/* Update checksum(S) = checksum(A)Z + d1*chekcsum(Z); */
 		/* Dingwen */
-
       }
       ierr = VecNorm(Z,NORM_2,&dp);CHKERRQ(ierr);              /*    dp <- z'*z       */
     } else if (ksp->normtype == KSP_NORM_UNPRECONDITIONED && ksp->chknorm < i+2) {
       ierr = VecNorm(R,NORM_2,&dp);CHKERRQ(ierr);              /*    dp <- r'*r       */
     } else if (ksp->normtype == KSP_NORM_NATURAL) {
       ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);               /*     z <- Br         */
-      
+ 	  
 	  /* Dingwen */
 	  ierr = VecXDot(C1,Z, &CKSZ);CHKERRQ(ierr);				/* Update checksum(Z) */
 	  /* Dingwen */
@@ -334,6 +373,7 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
     } else {
       dp = 0.0;
     }
+	  
     ksp->rnorm = dp;
     CHKERRQ(ierr);KSPLogResidualHistory(ksp,dp);CHKERRQ(ierr);
     ierr = KSPMonitor(ksp,i+1,dp);CHKERRQ(ierr);
@@ -351,6 +391,7 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
         ierr = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);
       }
     }
+		  
     if ((ksp->normtype != KSP_NORM_NATURAL) || (ksp->chknorm >= i+2)) {
       if (cg->singlereduction) {
         PetscScalar tmp[2];
@@ -363,8 +404,22 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
       }
       KSPCheckDot(ksp,beta);
     }
-
+	
     i++;
+	
+	/* Dingwen */
+	/* Inject error */
+	if ((i==2) && (flag))
+	{
+		PetscInt pos;
+		pos		= 1;
+		v	 	= 1000;
+		ierr	= VecSetValues(X,1,&pos,&v,INSERT_VALUES);CHKERRQ(ierr);
+		flag	= PETSC_FALSE;
+		printf ("Inject an error in position-%d of vector X at the end of iteration-%d\n", pos,i-1);
+	}
+	/* Dingwen */
+	
   } while (i<ksp->max_it);
   /* Dingwen */
   ierr = VecXDot(C1,X,&sumX);CHKERRQ(ierr);
