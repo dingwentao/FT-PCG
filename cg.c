@@ -225,7 +225,7 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
   ierr = KSP_MatMultTranspose(ksp,Amat,C1,CKSAmat);CHKERRQ(ierr);
   ierr = VecAXPY(CKSAmat,-d1,C1);CHKERRQ(ierr);					/* Compute the initial checksum(A) */
   itv_c = 2;
-  itv_d = 1;
+  itv_d = 10;
   /* Dingwen */
   
   i = 0;
@@ -260,13 +260,11 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
 		}
 		else if (i%(itv_c*itv_d) == 0)
 		{
-			printf ("Checkpointing start...\n");
 			printf ("Checkpoint iteration-%d\n",i);
 			ierr = VecCopy(X,CKPX);CHKERRQ(ierr);
 			ierr = VecCopy(P,CKPP);CHKERRQ(ierr);
 			CKPbetaold = betaold;
 			CKPi = i;
-			printf ("Checkpointing end.\n");
 		}
 	}
 	  ksp->its = i+1;
@@ -409,14 +407,13 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
 	
 	/* Dingwen */
 	/* Inject error */
-	if ((i==2) && (flag))
+	if ((i==50) && (flag))
 	{
-		PetscInt pos;
-		pos		= 1;
 		v	 	= 1000;
-		ierr	= VecSetValues(X,1,&pos,&v,INSERT_VALUES);CHKERRQ(ierr);
+		ierr	= VecSet(X,v);CHKERRQ(ierr);
 		flag	= PETSC_FALSE;
-		printf ("Inject an error in position-%d of vector X at the end of iteration-%d\n", pos,i-1);
+		printf ("Inject an error in vector X at the end of iteration-%d\n", i-1);
+		PetscBarrier(X);
 	}
 	/* Dingwen */
 	
@@ -424,10 +421,10 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
   /* Dingwen */
   ierr = VecXDot(C1,X,&sumX);CHKERRQ(ierr);
   ierr = VecXDot(C1,R,&sumR);CHKERRQ(ierr);
-  printf ("\nsum of X = %f\n", sumX);
-  printf ("\nchecksum(X) = %f\n", CKSX);
-  printf ("\nsum of X = %f\n", sumR);
-  printf ("\nchecksum(R) = %f\n", CKSR);
+  printf ("sum of X = %f\n", sumX);
+  printf ("checksum(X) = %f\n", CKSX);
+  printf ("sum of R = %f\n", sumR);
+  printf ("checksum(R) = %f\n", CKSR);
   /* Dingwen */
   if (i >= ksp->max_it) ksp->reason = KSP_DIVERGED_ITS;
   if (eigs) cg->ned = ksp->its;
@@ -446,7 +443,7 @@ PetscErrorCode KSPDestroy_CG(KSP ksp)
   if (ksp->calc_sings) {
     ierr = PetscFree4(cg->e,cg->d,cg->ee,cg->dd);CHKERRQ(ierr);
   }
-  ierr = KSPDestroyDefault(ksp);CHKERRQ(ierr);
+  ierr = KSPDestroyDefault(ksp);CHKERRQ(ier	r);
   ierr = PetscObjectComposeFunction((PetscObject)ksp,"KSPCGSetType_C",NULL);CHKERRQ(ierr);
   ierr = PetscObjectComposeFunction((PetscObject)ksp,"KSPCGUseSingleReduction_C",NULL);CHKERRQ(ierr);
   PetscFunctionReturn(0);
