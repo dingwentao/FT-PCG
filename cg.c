@@ -443,7 +443,7 @@ PetscErrorCode KSPDestroy_CG(KSP ksp)
   if (ksp->calc_sings) {
     ierr = PetscFree4(cg->e,cg->d,cg->ee,cg->dd);CHKERRQ(ierr);
   }
-  ierr = KSPDestroyDefault(ksp);CHKERRQ(ier	r);
+  ierr = KSPDestroyDefault(ksp);CHKERRQ(ierr);
   ierr = PetscObjectComposeFunction((PetscObject)ksp,"KSPCGSetType_C",NULL);CHKERRQ(ierr);
   ierr = PetscObjectComposeFunction((PetscObject)ksp,"KSPCGUseSingleReduction_C",NULL);CHKERRQ(ierr);
   PetscFunctionReturn(0);
