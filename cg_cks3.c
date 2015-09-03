@@ -41,6 +41,7 @@
     related to the type of matrix (e.g. complex symmetric) being solved and
     data used during the optional Lanczo process used to compute eigenvalues
 */
+#include <time.h>
 #include <../src/ksp/ksp/impls/cg/cgimpl.h>       /*I "petscksp.h" I*/
 extern PetscErrorCode KSPComputeExtremeSingularValues_CG(KSP,PetscReal*,PetscReal*);
 extern PetscErrorCode KSPComputeEigenvalues_CG(KSP,PetscInt,PetscReal*,PetscReal*,PetscInt*);
@@ -149,7 +150,8 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
  
  
  /* Dingwen */
- int rank;									/* Get MPI variables */
+ int rank,size;									/* Get MPI variables */
+ MPI_Comm_size	(MPI_COMM_WORLD,&size);
  MPI_Comm_rank	(MPI_COMM_WORLD,&rank);
  /* Dingwen */
  
@@ -225,17 +227,24 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
 
   /* Dingwen */
   /* checksum coefficients initialization */
-  PetscInt size;
-  ierr = VecGetSize(B,&size);	
-  for (i=0; i<size; i++)
+  PetscInt n;
+  PetscInt *index;
+  PetscScalar *v1,*v2,*v3;
+  ierr = VecGetSize(B,&n);
+  v1 	= (PetscScalar *)malloc(n*sizeof(PetscScalar));
+  v2 	= (PetscScalar *)malloc(n*sizeof(PetscScalar));
+  v3 	= (PetscScalar *)malloc(n*sizeof(PetscScalar));
+  index	= (PetscInt *)malloc(n*sizeof(PetscInt));
+  for (i=0; i<n; i++)
   {
-	  v		= 1.0;
-	  ierr	= VecSetValues(C1,1,&i,&v,INSERT_VALUES);CHKERRQ(ierr);	
-	  v		= i+1.0;
-	  ierr 	= VecSetValues(C2,1,&i,&v,INSERT_VALUES);CHKERRQ(ierr);
-	  v		= 1/(i+1.0);
-	  ierr	= VecSetValues(C3,1,&i,&v,INSERT_VALUES);CHKERRQ(ierr);
-  }	
+	  index[i] = i;
+	  v1[i] = 1.0;
+	  v2[i] = i+1.0;
+	  v3[i] = 1/(i+1.0);
+  }
+  ierr	= VecSetValues(C1,n,index,v1,INSERT_VALUES);CHKERRQ(ierr);	
+  ierr 	= VecSetValues(C2,n,index,v2,INSERT_VALUES);CHKERRQ(ierr);
+  ierr	= VecSetValues(C3,n,index,v3,INSERT_VALUES);CHKERRQ(ierr);	
   d1 = 1.0;
   d2 = 2.0;
   d3 = 3.0;
@@ -263,12 +272,15 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
   ierr = VecXDot(C3,Z,&CKSZ3);CHKERRQ(ierr);						/* Compute the initial checksum3(Z) */
   itv_c = 2;
   itv_d = 10;
-  flag1 = PETSC_TRUE;
+  //flag1 = PETSC_TRUE;
   //flag2 = PETSC_TRUE;
   //flag3 = PETSC_TRUE;
   //flag4 = PETSC_TRUE;
   //flag5 = PETSC_TRUE;
-  /* Dingwen */
+
+  struct timespec start, end;
+  long long int local_diff, global_diff;
+  clock_gettime(CLOCK_MONOTONIC, &start);
   
   i = 0;
   do {
@@ -673,28 +685,13 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
 	
   } while (i<ksp->max_it);
   /* Dingwen */
-  ierr = VecXDot(C1,X,&sumX1);CHKERRQ(ierr);
-  ierr = VecXDot(C1,R,&sumR1);CHKERRQ(ierr);
-  ierr = VecXDot(C2,X,&sumX2);CHKERRQ(ierr);
-  ierr = VecXDot(C2,R,&sumR2);CHKERRQ(ierr);
-  ierr = VecXDot(C3,X,&sumX3);CHKERRQ(ierr);
-  ierr = VecXDot(C3,R,&sumR3);CHKERRQ(ierr);
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  local_diff = 1000000000L*(end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec);
+  MPI_Reduce(&local_diff, &global_diff, 1, MPI_LONG_LONG_INT, MPI_SUM, 0, MPI_COMM_WORLD);
   if (rank==0)
-  {
-	  // printf ("sum1 of X = %f\n", sumX1);
-	  // printf ("checksum1(X) = %f\n", CKSX1);
-	  // printf ("sum2 of X = %f\n", sumX2);
-	  // printf ("checksum2(X) = %f\n", CKSX2);
-	  // printf ("sum3 of X = %f\n", sumX3);
-	  // printf ("checksum3(X) = %f\n", CKSX3);
-	  // printf ("sum1 of R = %f\n", sumR1);
-	  // printf ("checksum1(R) = %f\n", CKSR1);
-	  // printf ("sum2 of R = %f\n", sumR2);
-	  // printf ("checksum2(R) = %f\n", CKSR2);
-	  // printf ("sum3 of R = %f\n", sumR3);
-	  // printf ("checksum3(R) = %f\n", CKSR3);
+	  printf("elapsed time of main loop = %lf nanoseconds\n", (double) global_diff/size);
+  if (rank==0)
 	  printf ("Number of iterations without rollback = %d\n", i+1);
-  }
   /* Dingwen */
   if (i >= ksp->max_it) ksp->reason = KSP_DIVERGED_ITS;
   if (eigs) cg->ned = ksp->its;
@@ -870,7 +867,3 @@ PETSC_EXTERN PetscErrorCode KSPCreate_CG(KSP ksp)
   ierr = PetscObjectComposeFunction((PetscObject)ksp,"KSPCGUseSingleReduction_C",KSPCGUseSingleReduction_CG);CHKERRQ(ierr);
   PetscFunctionReturn(0);
 }
-
-
-
-

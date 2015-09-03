@@ -41,6 +41,7 @@
     related to the type of matrix (e.g. complex symmetric) being solved and
     data used during the optional Lanczo process used to compute eigenvalues
 */
+#include <time.h>
 #include <../src/ksp/ksp/impls/cg/cgimpl.h>       /*I "petscksp.h" I*/
 extern PetscErrorCode KSPComputeExtremeSingularValues_CG(KSP,PetscReal*,PetscReal*);
 extern PetscErrorCode KSPComputeEigenvalues_CG(KSP,PetscInt,PetscReal*,PetscReal*,PetscInt*);
@@ -58,7 +59,7 @@ PetscErrorCode KSPSetUp_CG(KSP ksp)
   KSP_CG         *cgP = (KSP_CG*)ksp->data;
   PetscErrorCode ierr;
   /* Dingwen */
-  PetscInt			 maxit = ksp->max_it,nwork = 8; /* add predefined vectors C1,C2, checksum(A) CKSAmat and checkpoint vectors CKPX,CKPP */
+  PetscInt			 maxit = ksp->max_it,nwork = 7; /* add predefined vectors C1, checksum(A) CKSAmat and checkpoint vectors CKPX,CKPP */
   //  PetscInt       maxit = ksp->max_it,nwork = 3;
 
   PetscFunctionBegin;
@@ -106,13 +107,15 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
   PetscInt		itv_d, itv_c;
   PetscScalar	CKSX,CKSZ,CKSR,CKSP,CKSS,CKSW;
   Vec			CKSAmat;
-  Vec			C1,C2;
-  PetscScalar	d1,d2;
+  Vec			C1;
+  PetscScalar	d1;
   PetscScalar	sumX,sumR;
   Vec			CKPX,CKPP;
   PetscScalar	CKPbetaold;
   PetscInt		CKPi;
-  PetscBool		flag = PETSC_TRUE;
+  PetscBool		flag = PETSC_FALSE;
+  PetscScalar	v;
+  PetscInt		pos;
   /* Dingwen */
   PetscFunctionBegin;
   ierr = PCGetDiagonalScale(ksp->pc,&diagonalscale);CHKERRQ(ierr);
@@ -131,9 +134,14 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
   CKPP			= ksp->work[4];
   CKSAmat		= ksp->work[5];
   C1			= ksp->work[6];
-  C2			= ksp->work[7];
   /* Dingwen */
   
+  /* Dingwen */
+  int rank,size;									/* Get MPI variables */
+  MPI_Comm_rank	(MPI_COMM_WORLD,&rank);
+  MPI_Comm_size	(MPI_COMM_WORLD,&size);
+  /* Dingwen */
+
   #define VecXDot(x,y,a) (((cg->type) == (KSP_CG_HERMITIAN)) ? VecDot(x,y,a) : VecTDot(x,y,a))
 
   if (cg->singlereduction) {
@@ -158,18 +166,19 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
 
   /* Dingwen */	
   /* checksum coefficients initialization */
-  PetscScalar v;
-  PetscInt size;
-  ierr = VecGetSize(B,&size);
-  for (i=0; i<size; i++)
+  PetscInt n;
+  PetscInt *index;
+  PetscScalar *v1;
+  ierr = VecGetSize(B,&n);
+  v1 	= (PetscScalar *)malloc(n*sizeof(PetscScalar));
+  index	= (PetscInt *)malloc(n*sizeof(PetscInt));
+  for (i=0; i<n; i++)
   {
-	  v	 	= 1;
-	  ierr	= VecSetValues(C1,1,&i,&v,INSERT_VALUES);CHKERRQ(ierr);
-	  v		= i;
-	  ierr 	= VecSetValues(C2,1,&i,&v,INSERT_VALUES);CHKERRQ(ierr);
+	  index[i] = i;
+	  v1[i] = 1.0;
   }
+  ierr	= VecSetValues(C1,n,index,v1,INSERT_VALUES);CHKERRQ(ierr);	
   d1 = 1.0;
-  d2 = 2.0;
   /* Dingwen */
 
   switch (ksp->normtype) {
@@ -230,6 +239,10 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
   itv_d = 10;
   /* Dingwen */
   
+
+  struct timespec start, end;
+  long long int local_diff, global_diff;
+  clock_gettime(CLOCK_MONOTONIC, &start);
   i = 0;
   do {
 	  /* Dingwen */
@@ -237,11 +250,11 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
 	  {
 		  ierr = VecXDot(C1,X,&sumX);CHKERRQ(ierr);
 		  ierr = VecXDot(C1,R,&sumR);CHKERRQ(ierr);
-		  if ((PetscAbsScalar(sumX-CKSX) > 1.0e-6) || (PetscAbsScalar(sumR-CKSR) > 1.0e-66666))
+		  if ((PetscAbsScalar(sumX-CKSX) > 1.0e-6) || (PetscAbsScalar(sumR-CKSR) > 1.0e-6))
 		  {
 			  /* Rollback and Recovery */
-			  printf ("Recovery start...\n");
-			  printf ("Rollback from iteration-%d to iteration-%d\n",i,CKPi);
+			  if (rank == 0) printf ("Recovery start...\n");
+			  if (rank == 0) printf ("Rollback from iteration-%d to iteration-%d\n",i,CKPi);
 			  betaold = CKPbetaold;										/* Recovery scalar betaold by checkpoint*/
 			  i = CKPi;													/* Recovery integer i by checkpoint */
 			  ierr = VecCopy(CKPP,P);CHKERRQ(ierr);						/* Recovery vector P from checkpoint */
@@ -260,14 +273,14 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
 		}
 		else if (i%(itv_c*itv_d) == 0)
 		{
-			printf ("Checkpoint iteration-%d\n",i);
+			if(rank==0) printf ("Checkpoint iteration-%d\n",i);
 			ierr = VecCopy(X,CKPX);CHKERRQ(ierr);
 			ierr = VecCopy(P,CKPP);CHKERRQ(ierr);
 			CKPbetaold = betaold;
 			CKPi = i;
 		}
 	}
-	  ksp->its = i+1;
+	  ksp->its++;
 	  if (beta == 0.0) {
       ksp->reason = KSP_CONVERGED_ATOL;
       ierr        = PetscInfo(ksp,"converged due to beta = 0\n");CHKERRQ(ierr);
@@ -409,23 +422,25 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
 	/* Inject error */
 	if ((i==50) && (flag))
 	{
-		v	 	= 1000;
-		ierr	= VecSet(X,v);CHKERRQ(ierr);
+		pos		= 1000;
+		v	 	= -1;
+		ierr	= VecSetValues(X,1,&pos,&v,INSERT_VALUES);CHKERRQ(ierr);
+		ierr	= VecAssemblyBegin(X);CHKERRQ(ierr);
+		ierr	= VecAssemblyEnd(X);CHKERRQ(ierr);  
 		flag	= PETSC_FALSE;
-		printf ("Inject an error in vector X at the end of iteration-%d\n", i-1);
-		PetscBarrier(X);
+		if (rank==0)printf ("Inject an error at the end of iteration-%d\n", i);
 	}
 	/* Dingwen */
 	
   } while (i<ksp->max_it);
-  /* Dingwen */
-  ierr = VecXDot(C1,X,&sumX);CHKERRQ(ierr);
-  ierr = VecXDot(C1,R,&sumR);CHKERRQ(ierr);
-  printf ("sum of X = %f\n", sumX);
-  printf ("checksum(X) = %f\n", CKSX);
-  printf ("sum of R = %f\n", sumR);
-  printf ("checksum(R) = %f\n", CKSR);
-  /* Dingwen */
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  local_diff = 1000000000L*(end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec);
+  MPI_Reduce(&local_diff, &global_diff, 1, MPI_LONG_LONG_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+  if (rank==0)
+	  printf("elapsed time of main loop = %lf nanoseconds\n", (double) global_diff/size);
+  if (rank==0)
+	  printf ("Number of iterations without rollback = %d\n", i+1);
+
   if (i >= ksp->max_it) ksp->reason = KSP_DIVERGED_ITS;
   if (eigs) cg->ned = ksp->its;
   PetscFunctionReturn(0);
@@ -600,7 +615,3 @@ PETSC_EXTERN PetscErrorCode KSPCreate_CG(KSP ksp)
   ierr = PetscObjectComposeFunction((PetscObject)ksp,"KSPCGUseSingleReduction_C",KSPCGUseSingleReduction_CG);CHKERRQ(ierr);
   PetscFunctionReturn(0);
 }
-
-
-
-
