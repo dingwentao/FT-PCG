@@ -41,6 +41,7 @@
     related to the type of matrix (e.g. complex symmetric) being solved and
     data used during the optional Lanczo process used to compute eigenvalues
 */
+#include <time.h>
 #include <../src/ksp/ksp/impls/cg/cgimpl.h>       /*I "petscksp.h" I*/
 extern PetscErrorCode KSPComputeExtremeSingularValues_CG(KSP,PetscReal*,PetscReal*);
 extern PetscErrorCode KSPComputeEigenvalues_CG(KSP,PetscInt,PetscReal*,PetscReal*,PetscInt*);
@@ -58,7 +59,7 @@ PetscErrorCode KSPSetUp_CG(KSP ksp)
   KSP_CG         *cgP = (KSP_CG*)ksp->data;
   PetscErrorCode ierr;
   /* Dingwen */
-  PetscInt			 maxit = ksp->max_it,nwork = 8; /* add predefined vectors C1,C2, checksum(A) CKSAmat and checkpoint vectors CKPX,CKPP */
+  PetscInt			 maxit = ksp->max_it,nwork = 11; /* add predefined vectors, checksum(A) and checkpoint vectors */
   //  PetscInt       maxit = ksp->max_it,nwork = 3;
 
   PetscFunctionBegin;
@@ -103,22 +104,228 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
   Mat            Amat,Pmat;
   PetscBool      diagonalscale;
   /* Dingwen */
-  PetscInt		itv_d, itv_c;
-  PetscScalar	CKSX,CKSZ,CKSR,CKSP,CKSS,CKSW;
+  PetscScalar	CKSX,CKSZ,CKSR,CKSP,CKSW;
+  PetscScalar	CKSX1,CKSZ1,CKSR1,CKSP1,CKSS1,CKSW1;
+  PetscScalar	CKSX2,CKSZ2,CKSR2,CKSP2,CKSS2,CKSW2;
+  PetscScalar	CKSX3,CKSZ3,CKSR3,CKSP3,CKSS3,CKSW3;
+  Vec			CKSAmat1;
+  Vec			CKSAmat2;
+  Vec			CKSAmat3;
+  Vec			C1,C2,C3;
+  PetscScalar	d1,d2,d3;
   Vec			CKSAmat;
-  Vec			C1,C2;
-  PetscScalar	d1,d2;
-  PetscScalar	sumX,sumR;
+  PetscScalar	sumX,sumZ,sumR,sumP,sumW;
   Vec			CKPX,CKPP;
   PetscScalar	CKPbetaold;
   PetscInt		CKPi;
-  PetscBool		flag = PETSC_TRUE;
+  PetscBool		flag1 = PETSC_TRUE,flag2 = PETSC_TRUE,flag3 = PETSC_TRUE,flag4 = PETSC_TRUE,flag5 = PETSC_TRUE,
+				flag6 = PETSC_TRUE,flag7 = PETSC_TRUE,flag8 = PETSC_TRUE,flag9 = PETSC_TRUE,flag10 = PETSC_TRUE;
+  PetscScalar	v;
+  PetscInt		pos1,pos2;
+  PetscInt		solver_type, error_type;
+  PetscInt		itv_c, itv_d;
+  PetscInt		inj_itr, inj_times;
+  PetscInt		rank,size;
   /* Dingwen */
+  
   PetscFunctionBegin;
+  #define VecXDot(x,y,a) (((cg->type) == (KSP_CG_HERMITIAN)) ? VecDot(x,y,a) : VecTDot(x,y,a))
+  /* Dingwen */
+  MPI_Comm_rank	(MPI_COMM_WORLD,&rank);
+  MPI_Comm_size	(MPI_COMM_WORLD,&size);
+  solver_type	= ksp->solver_type;
+  error_type 	= ksp->error_type;
+  itv_c 		= ksp->itv_c;
+  itv_d 		= ksp->itv_d;
+  inj_itr 		= ksp->inj_itr;
+  inj_times 	= ksp->inj_times;
+  /* Dingwen */
+
+  
   ierr = PCGetDiagonalScale(ksp->pc,&diagonalscale);CHKERRQ(ierr);
   if (diagonalscale) SETERRQ1(PetscObjectComm((PetscObject)ksp),PETSC_ERR_SUP,"Krylov method %s does not support diagonal scaling",((PetscObject)ksp)->type_name);
 
-  cg            = (KSP_CG*)ksp->data;
+  if(solver_type==0)
+  {
+	  cg            = (KSP_CG*)ksp->data;
+  eigs          = ksp->calc_sings;
+  stored_max_it = ksp->max_it;
+  X             = ksp->vec_sol;
+  B             = ksp->vec_rhs;
+  R             = ksp->work[0];
+  Z             = ksp->work[1];
+  P             = ksp->work[2];
+  if (cg->singlereduction) {
+    S = ksp->work[3];
+    W = ksp->work[4];
+  } else {
+    S = 0;                      /* unused */
+    W = Z;
+  }
+
+  if (eigs) {e = cg->e; d = cg->d; e[0] = 0.0; }
+  ierr = PCGetOperators(ksp->pc,&Amat,&Pmat);CHKERRQ(ierr);
+
+  ksp->its = 0;
+  if (!ksp->guess_zero) {
+    ierr = KSP_MatMult(ksp,Amat,X,R);CHKERRQ(ierr);            /*     r <- b - Ax     */
+    ierr = VecAYPX(R,-1.0,B);CHKERRQ(ierr);
+  } else {
+    ierr = VecCopy(B,R);CHKERRQ(ierr);                         /*     r <- b (x is 0) */
+  }
+
+  switch (ksp->normtype) {
+  case KSP_NORM_PRECONDITIONED:
+    ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);                   /*     z <- Br         */
+    ierr = VecNorm(Z,NORM_2,&dp);CHKERRQ(ierr);                /*    dp <- z'*z = e'*A'*B'*B*A'*e'     */
+    break;
+  case KSP_NORM_UNPRECONDITIONED:
+    ierr = VecNorm(R,NORM_2,&dp);CHKERRQ(ierr);                /*    dp <- r'*r = e'*A'*A*e            */
+    break;
+  case KSP_NORM_NATURAL:
+    ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);                   /*     z <- Br         */
+    if (cg->singlereduction) {
+      ierr = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);
+      ierr = VecXDot(Z,S,&delta);CHKERRQ(ierr);
+    }
+    ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);                     /*  beta <- z'*r       */
+    KSPCheckDot(ksp,beta);
+    dp = PetscSqrtReal(PetscAbsScalar(beta));                           /*    dp <- r'*z = r'*B*r = e'*A'*B*A*e */
+    break;
+  case KSP_NORM_NONE:
+    dp = 0.0;
+    break;
+  default: SETERRQ1(PetscObjectComm((PetscObject)ksp),PETSC_ERR_SUP,"%s",KSPNormTypes[ksp->normtype]);
+  }
+  ierr       = KSPLogResidualHistory(ksp,dp);CHKERRQ(ierr);
+  ierr       = KSPMonitor(ksp,0,dp);CHKERRQ(ierr);
+  ksp->rnorm = dp;
+
+  ierr = (*ksp->converged)(ksp,0,dp,&ksp->reason,ksp->cnvP);CHKERRQ(ierr);      /* test for convergence */
+  if (ksp->reason) PetscFunctionReturn(0);
+
+  if (ksp->normtype != KSP_NORM_PRECONDITIONED && (ksp->normtype != KSP_NORM_NATURAL)) {
+    ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);                   /*     z <- Br         */
+  }
+  if (ksp->normtype != KSP_NORM_NATURAL) {
+    if (cg->singlereduction) {
+      ierr = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);
+      ierr = VecXDot(Z,S,&delta);CHKERRQ(ierr);
+    }
+    ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);         /*  beta <- z'*r       */
+    KSPCheckDot(ksp,beta);
+  }
+
+  struct timespec start, end;
+  long long int local_diff, global_diff;
+  clock_gettime(CLOCK_REALTIME, &start);
+
+  i = 0;
+  do {
+    ksp->its = i+1;
+    if (beta == 0.0) {
+      ksp->reason = KSP_CONVERGED_ATOL;
+      ierr        = PetscInfo(ksp,"converged due to beta = 0\n");CHKERRQ(ierr);
+      break;
+#if !defined(PETSC_USE_COMPLEX)
+    } else if ((i > 0) && (beta*betaold < 0.0)) {
+      ksp->reason = KSP_DIVERGED_INDEFINITE_PC;
+      ierr        = PetscInfo(ksp,"diverging due to indefinite preconditioner\n");CHKERRQ(ierr);
+      break;
+#endif
+    }
+    if (!i) {
+      ierr = VecCopy(Z,P);CHKERRQ(ierr);         /*     p <- z          */
+      b    = 0.0;
+    } else {
+      b = beta/betaold;
+      if (eigs) {
+        if (ksp->max_it != stored_max_it) SETERRQ(PetscObjectComm((PetscObject)ksp),PETSC_ERR_SUP,"Can not change maxit AND calculate eigenvalues");
+        e[i] = PetscSqrtReal(PetscAbsScalar(b))/a;
+      }
+      ierr = VecAYPX(P,b,Z);CHKERRQ(ierr);    /*     p <- z + b* p   */
+    }
+    dpiold = dpi;
+    if (!cg->singlereduction || !i) {
+      ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);          /*     w <- Ap         */
+      ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);                  /*     dpi <- p'w     */
+    } else {
+      ierr = VecAYPX(W,beta/betaold,S);CHKERRQ(ierr);                  /*     w <- Ap         */
+      dpi  = delta - beta*beta*dpiold/(betaold*betaold);             /*     dpi <- p'w     */
+    }
+    betaold = beta;
+    KSPCheckDot(ksp,beta);
+
+    if ((dpi == 0.0) || ((i > 0) && (PetscRealPart(dpi*dpiold) <= 0.0))) {
+      ksp->reason = KSP_DIVERGED_INDEFINITE_MAT;
+      ierr        = PetscInfo(ksp,"diverging due to indefinite or negative definite matrix\n");CHKERRQ(ierr);
+      break;
+    }
+    a = beta/dpi;                                 /*     a = beta/p'w   */
+    if (eigs) d[i] = PetscSqrtReal(PetscAbsScalar(b))*e[i] + 1.0/a;
+    ierr = VecAXPY(X,a,P);CHKERRQ(ierr);          /*     x <- x + ap     */
+    ierr = VecAXPY(R,-a,W);CHKERRQ(ierr);                      /*     r <- r - aw    */
+    if (ksp->normtype == KSP_NORM_PRECONDITIONED && ksp->chknorm < i+2) {
+      ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);               /*     z <- Br         */
+      if (cg->singlereduction) {
+        ierr = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);
+      }
+      ierr = VecNorm(Z,NORM_2,&dp);CHKERRQ(ierr);              /*    dp <- z'*z       */
+    } else if (ksp->normtype == KSP_NORM_UNPRECONDITIONED && ksp->chknorm < i+2) {
+      ierr = VecNorm(R,NORM_2,&dp);CHKERRQ(ierr);              /*    dp <- r'*r       */
+    } else if (ksp->normtype == KSP_NORM_NATURAL) {
+      ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);               /*     z <- Br         */
+      if (cg->singlereduction) {
+        PetscScalar tmp[2];
+        Vec         vecs[2];
+        vecs[0] = S; vecs[1] = R;
+        ierr    = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);
+        ierr  = VecMDot(Z,2,vecs,tmp);CHKERRQ(ierr);
+        delta = tmp[0]; beta = tmp[1];
+      } else {
+        ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);     /*  beta <- r'*z       */
+      }
+      KSPCheckDot(ksp,beta);
+      dp = PetscSqrtReal(PetscAbsScalar(beta));
+    } else {
+      dp = 0.0;
+    }
+    ksp->rnorm = dp;
+    CHKERRQ(ierr);KSPLogResidualHistory(ksp,dp);CHKERRQ(ierr);
+    ierr = KSPMonitor(ksp,i+1,dp);CHKERRQ(ierr);
+    ierr = (*ksp->converged)(ksp,i+1,dp,&ksp->reason,ksp->cnvP);CHKERRQ(ierr);
+    if (ksp->reason) break;
+
+    if ((ksp->normtype != KSP_NORM_PRECONDITIONED && (ksp->normtype != KSP_NORM_NATURAL)) || (ksp->chknorm >= i+2)) {
+      ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);                   /*     z <- Br         */
+      if (cg->singlereduction) {
+        ierr = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);
+      }
+    }
+    if ((ksp->normtype != KSP_NORM_NATURAL) || (ksp->chknorm >= i+2)) {
+      if (cg->singlereduction) {
+        PetscScalar tmp[2];
+        Vec         vecs[2];
+        vecs[0] = S; vecs[1] = R;
+        ierr  = VecMDot(Z,2,vecs,tmp);CHKERRQ(ierr);
+        delta = tmp[0]; beta = tmp[1];
+      } else {
+        ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);        /*  beta <- z'*r       */
+      }
+      KSPCheckDot(ksp,beta);
+    }
+
+    i++;
+  } while (i<ksp->max_it);
+  clock_gettime(CLOCK_REALTIME, &end);
+  local_diff = 1000000000L*(end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec);
+  MPI_Reduce(&local_diff, &global_diff, 1, MPI_LONG_LONG_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+  PetscPrintf(MPI_COMM_WORLD,"elapsed time of main loop = %lf nanoseconds\n", (double) (global_diff)/size);
+  }
+  
+  if (solver_type==1)
+  {
+	  cg            = (KSP_CG*)ksp->data;
   eigs          = ksp->calc_sings;
   stored_max_it = ksp->max_it;
   X             = ksp->vec_sol;
@@ -131,11 +338,8 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
   CKPP			= ksp->work[4];
   CKSAmat		= ksp->work[5];
   C1			= ksp->work[6];
-  C2			= ksp->work[7];
   /* Dingwen */
   
-  #define VecXDot(x,y,a) (((cg->type) == (KSP_CG_HERMITIAN)) ? VecDot(x,y,a) : VecTDot(x,y,a))
-
   if (cg->singlereduction) {
     S = ksp->work[8];
     W = ksp->work[9];
@@ -158,16 +362,19 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
 
   /* Dingwen */	
   /* checksum coefficients initialization */
-  PetscScalar v;
-  for (i=0; i<4; i++)
+  PetscInt n;
+  PetscInt *index;
+  PetscScalar *v1;
+  ierr = VecGetSize(B,&n);
+  v1 	= (PetscScalar *)malloc(n*sizeof(PetscScalar));
+  index	= (PetscInt *)malloc(n*sizeof(PetscInt));
+  for (i=0; i<n; i++)
   {
-	  v	 	= 1;
-	  ierr	= VecSetValues(C1,1,&i,&v,INSERT_VALUES);CHKERRQ(ierr);
-	  v		= i;
-	  ierr 	= VecSetValues(C2,1,&i,&v,INSERT_VALUES);CHKERRQ(ierr);
+	  index[i] = i;
+	  v1[i] = 1.0;
   }
+  ierr	= VecSetValues(C1,n,index,v1,INSERT_VALUES);CHKERRQ(ierr);	
   d1 = 1.0;
-  d2 = 2.0;
   /* Dingwen */
 
   switch (ksp->normtype) {
@@ -183,9 +390,6 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
     if (cg->singlereduction) {
       ierr = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);
       ierr = VecXDot(Z,S,&delta);CHKERRQ(ierr);
-	  /* Dingwen */
-	  ierr = VecXDot(C1,S,&CKSS);CHKERRQ(ierr);						/* Compute the initial checksum(S) */
-	  /* Dingwen */
 	}
     ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);                     /*  beta <- z'*r       */
     KSPCheckDot(ksp,beta);
@@ -224,50 +428,72 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
   ierr = VecXDot(C1,Z,&CKSZ);CHKERRQ(ierr);						/* Compute the initial checksum(Z) */
   ierr = KSP_MatMultTranspose(ksp,Amat,C1,CKSAmat);CHKERRQ(ierr);
   ierr = VecAXPY(CKSAmat,-d1,C1);CHKERRQ(ierr);					/* Compute the initial checksum(A) */
-  itv_c = 2;
-  itv_d = 10;
   /* Dingwen */
   
+
+  struct timespec start, end;
+  long long int local_diff, global_diff;
+  
+  struct timespec start_d, end_d;
+  struct timespec start_r, end_r;
+  struct timespec start_c, end_c;
+  struct timespec start_i, end_i;
+  long long int time_d = 0,time_r = 0,time_c = 0,time_i = 0;
+
+  clock_gettime(CLOCK_REALTIME, &start);
   i = 0;
+  PetscInt	numd = 0, numr = 0, numc = 0, numi = 0;
   do {
 	  /* Dingwen */
 	  if ((i>0) && (i%itv_d == 0))
 	  {
+		  clock_gettime(CLOCK_REALTIME, &start_d);
 		  ierr = VecXDot(C1,X,&sumX);CHKERRQ(ierr);
 		  ierr = VecXDot(C1,R,&sumR);CHKERRQ(ierr);
-		  if ((PetscAbsScalar(sumX-CKSX) > 1.0e-10) || (PetscAbsScalar(sumR-CKSR) > 1.0e-10))
+		  clock_gettime(CLOCK_REALTIME, &end_d);
+		  time_d += 1000000000L*(end_d.tv_sec - start_d.tv_sec) + (end_d.tv_nsec - start_d.tv_nsec);
+		  numd++;
+		  if ((PetscAbsScalar(sumX-CKSX)/(n*n) > 1.0e-10) || (PetscAbsScalar(sumR-CKSR)/(n*n) > 1.0e-10))
 		  {
+			  clock_gettime(CLOCK_REALTIME, &start_r);
 			  /* Rollback and Recovery */
-			  printf ("Recovery start...\n");
-			  printf ("Rollback from iteration-%d to iteration-%d\n",i,CKPi);
+			  PetscPrintf(MPI_COMM_WORLD,"Recovery start...\n");
+			  PetscPrintf(MPI_COMM_WORLD,"Rollback from iteration-%d to iteration-%d\n",i,CKPi);
 			  betaold = CKPbetaold;										/* Recovery scalar betaold by checkpoint*/
 			  i = CKPi;													/* Recovery integer i by checkpoint */
 			  ierr = VecCopy(CKPP,P);CHKERRQ(ierr);						/* Recovery vector P from checkpoint */
 			  ierr = VecXDot(C1,P,&CKSP);CHKERRQ(ierr);					/* Recovery checksum(P) by P */ 
-			  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);				/* Recovery vector W by P */
-			  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);				/* Recovery vector W by P */
-			  ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);						/* Recovery scalar dpi by P and W */
+			  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);			/* Recovery vector W by P */
+			  ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);					/* Recovery scalar dpi by P and W */
 			  ierr = VecCopy(CKPX,X);CHKERRQ(ierr);						/* Recovery vector X from checkpoint */
 			  ierr = VecXDot(C1,X,&CKSX);CHKERRQ(ierr);					/* Recovery checksum(X) by X */ 
-			  ierr = KSP_MatMult(ksp,Amat,X,R);CHKERRQ(ierr);				/* Recovery vector R by X */
+			  ierr = KSP_MatMult(ksp,Amat,X,R);CHKERRQ(ierr);			/* Recovery vector R by X */
 			  ierr = VecAYPX(R,-1.0,B);CHKERRQ(ierr);
 			  ierr = VecXDot(C1,R,&CKSR);CHKERRQ(ierr);					/* Recovery checksum(R) by R */
-			  ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);					/* Recovery vector Z by R */
-			  ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);					/* Recovery vector Z by R */
+			  ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);				/* Recovery vector Z by R */
 			  ierr = VecXDot(C1,Z,&CKSZ);CHKERRQ(ierr);					/* Recovery checksum(Z) by Z */
 			  ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);					/* Recovery scalar beta by Z and R */
-			  printf ("Recovery end.\n");
+			  PetscPrintf(MPI_COMM_WORLD,"Recovery end.\n");
+			  clock_gettime(CLOCK_REALTIME, &end_r);
+			  time_r += 1000000000L*(end_r.tv_sec - start_r.tv_sec) + (end_r.tv_nsec - start_r.tv_nsec);
+			  numr++;
 		}
 		else if (i%(itv_c*itv_d) == 0)
 		{
-			printf ("Checkpoint iteration-%d\n",i);
+			clock_gettime(CLOCK_REALTIME, &start_c);
 			ierr = VecCopy(X,CKPX);CHKERRQ(ierr);
 			ierr = VecCopy(P,CKPP);CHKERRQ(ierr);
 			CKPbetaold = betaold;
 			CKPi = i;
+			clock_gettime(CLOCK_REALTIME, &end_c);
+			time_c += 1000000000L*(end_c.tv_sec - start_c.tv_sec) + (end_c.tv_nsec - start_c.tv_nsec);
+			numc++;		
 		}
 	}
-	  ksp->its = i+1;
+	
+	clock_gettime(CLOCK_REALTIME, &start_i);
+
+	  ksp->its++;
 	  if (beta == 0.0) {
       ksp->reason = KSP_CONVERGED_ATOL;
       ierr        = PetscInfo(ksp,"converged due to beta = 0\n");CHKERRQ(ierr);
@@ -304,12 +530,56 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
 	  ierr = VecXDot(CKSAmat, P, &CKSW);CHKERRQ(ierr);
 	  CKSW = CKSW + d1*CKSP;									/* Update checksum(W) = checksum(A)P + d1*checksum(P); */
 	  /* Dingwen */
+	  
+	  /* Inject an error in W */
+	  if((i==inj_itr)&&(flag1)&&(error_type==1))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			W_SEQ;
+		  PetscScalar	*W_ARR;
+		  VecScatterCreateToAll(W,&ctx,&W_SEQ);
+		  VecScatterBegin(ctx,W,W_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,W,W_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(W_SEQ,&W_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= W_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(W,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&W_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(W);
+		  VecAssemblyEnd(W);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject an error in W of position-%d after MVM at iteration-%d\n", pos1,i);
+		  flag1	= PETSC_FALSE;
+	  }
+	  
+	  /* Inject two errors in W */
+	  if((i==inj_itr)&&(flag2)&(error_type==2))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			W_SEQ;
+		  PetscScalar	*W_ARR;
+		  VecScatterCreateToAll(W,&ctx,&W_SEQ);
+		  VecScatterBegin(ctx,W,W_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,W,W_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(W_SEQ,&W_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= W_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(W,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  pos2 = rand()/(RAND_MAX/n+1);
+		  v		= W_ARR[pos2]*inj_times;
+		  ierr	= VecSetValues(W,1,&pos2,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&W_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(W);
+		  VecAssemblyEnd(W);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject two errors in W of position-%d and position-%d after MVM at iteration-%d\n", pos1,pos2,i);
+		  flag2	= PETSC_FALSE;
+		}
     } else {
       ierr = VecAYPX(W,beta/betaold,S);CHKERRQ(ierr);                  /*     w <- Ap         */
       dpi  = delta - beta*beta*dpiold/(betaold*betaold);             /*     dpi <- p'w     */
-	  /* Dingwen */
-	  CKSW = beta/betaold*CKSW + CKSS;							/* Update checksum(W) = checksum(S) + beta/betaold*checksum(W); */
-	  /* Dingwen */
 	}
     betaold = beta;
     KSPCheckDot(ksp,beta);
@@ -341,10 +611,652 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
 	  
 	  if (cg->singlereduction) {
         ierr = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);			/* MVM */
-		/* Dingwen */
-		ierr = VecXDot(CKSAmat, Z, &CKSS);CHKERRQ(ierr);
-		CKSS = CKSS + d1*CKSZ;									/* Update checksum(S) = checksum(A)Z + d1*chekcsum(Z); */
-		/* Dingwen */
+      }
+      ierr = VecNorm(Z,NORM_2,&dp);CHKERRQ(ierr);              /*    dp <- z'*z       */
+    } else if (ksp->normtype == KSP_NORM_UNPRECONDITIONED && ksp->chknorm < i+2) {
+      ierr = VecNorm(R,NORM_2,&dp);CHKERRQ(ierr);              /*    dp <- r'*r       */
+    } else if (ksp->normtype == KSP_NORM_NATURAL) {
+      ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);               /*     z <- Br         */
+ 	  
+	  /* Dingwen */
+	  ierr = VecXDot(C1,Z, &CKSZ);CHKERRQ(ierr);				/* Update checksum(Z) */
+	  /* Dingwen */
+	  
+	  if (cg->singlereduction) {
+        PetscScalar tmp[2];
+        Vec         vecs[2];
+        vecs[0] = S; vecs[1] = R;
+        ierr    = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);
+        ierr  = VecMDot(Z,2,vecs,tmp);CHKERRQ(ierr);
+        delta = tmp[0]; beta = tmp[1];
+      } else {
+        ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);     /*  beta <- r'*z       */
+      }
+      KSPCheckDot(ksp,beta);
+      dp = PetscSqrtReal(PetscAbsScalar(beta));
+    } else {
+      dp = 0.0;
+    }
+	  
+    ksp->rnorm = dp;
+    CHKERRQ(ierr);KSPLogResidualHistory(ksp,dp);CHKERRQ(ierr);
+    ierr = KSPMonitor(ksp,i+1,dp);CHKERRQ(ierr);
+    ierr = (*ksp->converged)(ksp,i+1,dp,&ksp->reason,ksp->cnvP);CHKERRQ(ierr);
+    if (ksp->reason) break;
+
+    if ((ksp->normtype != KSP_NORM_PRECONDITIONED && (ksp->normtype != KSP_NORM_NATURAL)) || (ksp->chknorm >= i+2)) {
+      ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);                   /*     z <- Br         */
+	  
+	  /* Dingwen */
+	  ierr = VecXDot(C1,Z, &CKSZ);CHKERRQ(ierr);				/* Update checksum(Z) */
+	  /* Dingwen */
+      
+	  if (cg->singlereduction) {
+        ierr = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);
+      }
+    }
+		  
+    if ((ksp->normtype != KSP_NORM_NATURAL) || (ksp->chknorm >= i+2)) {
+      if (cg->singlereduction) {
+        PetscScalar tmp[2];
+        Vec         vecs[2];
+        vecs[0] = S; vecs[1] = R;
+        ierr  = VecMDot(Z,2,vecs,tmp);CHKERRQ(ierr);
+        delta = tmp[0]; beta = tmp[1];
+      } else {
+        ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);        /*  beta <- z'*r       */
+      }
+      KSPCheckDot(ksp,beta);
+    }
+	
+    i++;
+	
+	clock_gettime(CLOCK_REALTIME, &end_i);
+	time_i += 1000000000L*(end_i.tv_sec - start_i.tv_sec) + (end_i.tv_nsec - start_i.tv_nsec);
+	numi++;
+
+	/* Dingwen */
+		  /* Inject an error in P */
+	  if((i==inj_itr)&&(flag3)&&(error_type==3))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			P_SEQ;
+		  PetscScalar	*P_ARR;
+		  VecScatterCreateToAll(P,&ctx,&P_SEQ);
+		  VecScatterBegin(ctx,P,P_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,P,P_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(P_SEQ,&P_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= P_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(P,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&P_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(P);
+		  VecAssemblyEnd(P);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject an error in P of position-%d at the end of iteration-%d\n", pos1,i);
+		  flag3	= PETSC_FALSE;
+	  }
+	  
+	  /* Inject two errors in P */
+	  if((i==inj_itr)&&(flag4)&(error_type==4))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			P_SEQ;
+		  PetscScalar	*P_ARR;
+		  VecScatterCreateToAll(P,&ctx,&P_SEQ);
+		  VecScatterBegin(ctx,P,P_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,P,P_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(P_SEQ,&P_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= P_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(P,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  pos2 = rand()/(RAND_MAX/n+1);
+		  v		= P_ARR[pos2]*inj_times;
+		  ierr	= VecSetValues(P,1,&pos2,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&P_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(P);
+		  VecAssemblyEnd(P);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject two errors in P of position-%d and position-%d at the end of iteration-%d\n", pos1,pos2,i);
+		  flag4	= PETSC_FALSE;
+		}
+		
+		/* Inject an error in X*/
+	  if((i==inj_itr)&&(flag5)&&(error_type==5))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			X_SEQ;
+		  PetscScalar	*X_ARR;
+		  VecScatterCreateToAll(X,&ctx,&X_SEQ);
+		  VecScatterBegin(ctx,X,X_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,X,X_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(X_SEQ,&X_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= X_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(X,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&X_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(X);
+		  VecAssemblyEnd(X);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject an error in X of position-%d at the end of iteration-%d\n", pos1,i);
+		  flag5	= PETSC_FALSE;
+	  }
+	  
+	  /* Inject two errors in X*/
+	  if((i==inj_itr)&&(flag6)&&(error_type==6))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			X_SEQ;
+		  PetscScalar	*X_ARR;
+		  VecScatterCreateToAll(X,&ctx,&X_SEQ);
+		  VecScatterBegin(ctx,X,X_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,X,X_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(X_SEQ,&X_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= X_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(X,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  pos2 = rand()/(RAND_MAX/n+1);
+		  v		= X_ARR[pos2]*inj_times;
+		  ierr	= VecSetValues(X,1,&pos2,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&X_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(X);
+		  VecAssemblyEnd(X);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject two errors in X of position-%d and position-%d at the end of iteration-%d\n", pos1,pos2,i);
+		  flag6	= PETSC_FALSE;
+		}
+		
+		/* Inject an error in R */
+	  if((i==inj_itr)&&(flag7)&&(error_type==7))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			R_SEQ;
+		  PetscScalar	*R_ARR;
+		  VecScatterCreateToAll(R,&ctx,&R_SEQ);
+		  VecScatterBegin(ctx,R,R_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,R,R_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(R_SEQ,&R_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= R_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(R,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&R_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(R);
+		  VecAssemblyEnd(R);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject an error in R of position-%d at the end of iteration-%d\n", pos1,i);
+		  flag7	= PETSC_FALSE;
+	  }
+	  
+	  /* Inject two errors */
+	  if((i==inj_itr)&&(flag8)&&(error_type==8))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			R_SEQ;
+		  PetscScalar	*R_ARR;
+		  VecScatterCreateToAll(R,&ctx,&R_SEQ);
+		  VecScatterBegin(ctx,R,R_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,R,R_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(R_SEQ,&R_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= R_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(R,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  pos2 = rand()/(RAND_MAX/n+1);
+		  v		= R_ARR[pos2]*inj_times;
+		  ierr	= VecSetValues(R,1,&pos2,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&R_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(R);
+		  VecAssemblyEnd(R);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject two errors in R of position-%d and position-%d at the end of iteration-%d\n", pos1,pos2,i);
+		  flag8	= PETSC_FALSE;
+		}
+		
+		/* Inject an error in Z */
+	  if((i==inj_itr)&&(flag9)&&(error_type==9))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			Z_SEQ;
+		  PetscScalar	*Z_ARR;
+		  VecScatterCreateToAll(Z,&ctx,&Z_SEQ);
+		  VecScatterBegin(ctx,Z,Z_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,Z,Z_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(Z_SEQ,&Z_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= Z_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(Z,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&Z_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(Z);
+		  VecAssemblyEnd(Z);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject an error in Z of position-%d at the end of iteration-%d\n", pos1,i);
+		  flag9	= PETSC_FALSE;
+	  }
+	  
+	  /* Inject two errors */
+	  if((i==inj_itr)&&(flag10)&&(error_type==10))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			Z_SEQ;
+		  PetscScalar	*Z_ARR;
+		  VecScatterCreateToAll(Z,&ctx,&Z_SEQ);
+		  VecScatterBegin(ctx,Z,Z_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,Z,Z_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(Z_SEQ,&Z_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= Z_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(Z,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  pos2 = rand()/(RAND_MAX/n+1);
+		  v		= Z_ARR[pos2]*inj_times;
+		  ierr	= VecSetValues(Z,1,&pos2,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&Z_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(Z);
+		  VecAssemblyEnd(Z);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject two errors in Z of position-%d and position-%d at the end of iteration-%d\n", pos1,pos2,i);
+		  flag10	= PETSC_FALSE;
+		}
+	/* Dingwen */
+	
+  } while (i<ksp->max_it);
+  clock_gettime(CLOCK_REALTIME, &end);
+  local_diff = 1000000000L*(end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec);
+  MPI_Reduce(&local_diff, &global_diff, 1, MPI_LONG_LONG_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+  PetscPrintf(MPI_COMM_WORLD,"Number of detections = %d\n", numd);
+  PetscPrintf(MPI_COMM_WORLD,"Number of recoverys = %d\n", numr);
+  PetscPrintf(MPI_COMM_WORLD,"Number of checkpoints = %d\n", numc);
+  PetscPrintf(MPI_COMM_WORLD,"Number of iterations = %d\n", numi);
+  PetscPrintf(MPI_COMM_WORLD,"Average time of each detection = %lf nanoseconds\n", (double) (time_d)/numd);
+  PetscPrintf(MPI_COMM_WORLD,"Average time of each recovery = %lf nanoseconds\n", (double) (time_r)/numr);
+  PetscPrintf(MPI_COMM_WORLD,"Average time of each checkpoint = %lf nanoseconds\n", (double) (time_c)/numc);
+  PetscPrintf(MPI_COMM_WORLD,"Average time of each iteration = %lf nanoseconds\n", (double) (time_i)/numi);
+  PetscPrintf(MPI_COMM_WORLD,"Elapsed time of main loop = %lf nanoseconds\n", (double) (global_diff)/size);
+  PetscPrintf(MPI_COMM_WORLD,"Number of iterations without rollback = %d\n", i+1);
+  }
+  
+  if (solver_type==2)
+  {
+  cg            = (KSP_CG*)ksp->data;
+  eigs          = ksp->calc_sings;
+  stored_max_it = ksp->max_it;
+  X             = ksp->vec_sol;
+  B             = ksp->vec_rhs;
+  R             = ksp->work[0];
+  Z             = ksp->work[1];
+  P             = ksp->work[2];
+  /* Dingwen */
+  CKPX			= ksp->work[3];
+  CKPP			= ksp->work[4];
+  CKSAmat		= ksp->work[5];
+  C1			= ksp->work[6];
+  /* Dingwen */
+  
+  if (cg->singlereduction) {
+    S = ksp->work[8];
+    W = ksp->work[9];
+  } else {
+    S = 0;                      /* unused */
+    W = Z;
+  }
+    
+  if (eigs) {e = cg->e; d = cg->d; e[0] = 0.0; }
+  ierr = PCGetOperators(ksp->pc,&Amat,&Pmat);CHKERRQ(ierr);
+  
+  ksp->its = 0;
+  if (!ksp->guess_zero) {
+    ierr = KSP_MatMult(ksp,Amat,X,R);CHKERRQ(ierr);            /*     r <- b - Ax     */
+    ierr = VecAYPX(R,-1.0,B);CHKERRQ(ierr);
+  } else {
+    ierr = VecCopy(B,R);CHKERRQ(ierr);                         /*     r <- b (x is 0) */
+  }
+  
+
+  /* Dingwen */	
+  /* checksum coefficients initialization */
+  PetscInt n;
+  PetscInt *index;
+  PetscScalar *v1;
+  ierr = VecGetSize(B,&n);
+  v1 	= (PetscScalar *)malloc(n*sizeof(PetscScalar));
+  index	= (PetscInt *)malloc(n*sizeof(PetscInt));
+  for (i=0; i<n; i++)
+  {
+	  index[i] = i;
+	  v1[i] = 1.0;
+  }
+  ierr	= VecSetValues(C1,n,index,v1,INSERT_VALUES);CHKERRQ(ierr);	
+  /* Dingwen */
+
+  switch (ksp->normtype) {
+  case KSP_NORM_PRECONDITIONED:
+    ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);                   /*     z <- Br         */
+    ierr = VecNorm(Z,NORM_2,&dp);CHKERRQ(ierr);                /*    dp <- z'*z = e'*A'*B'*B*A'*e'     */
+    break;
+  case KSP_NORM_UNPRECONDITIONED:
+    ierr = VecNorm(R,NORM_2,&dp);CHKERRQ(ierr);                /*    dp <- r'*r = e'*A'*A*e            */
+    break;
+  case KSP_NORM_NATURAL:
+    ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);                   /*     z <- Br         */
+    if (cg->singlereduction) {
+      ierr = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);
+      ierr = VecXDot(Z,S,&delta);CHKERRQ(ierr);
+	}
+    ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);                     /*  beta <- z'*r       */
+    KSPCheckDot(ksp,beta);
+    dp = PetscSqrtReal(PetscAbsScalar(beta));                           /*    dp <- r'*z = r'*B*r = e'*A'*B*A*e */
+    break;
+  case KSP_NORM_NONE:
+    dp = 0.0;
+    break;
+  default: SETERRQ1(PetscObjectComm((PetscObject)ksp),PETSC_ERR_SUP,"%s",KSPNormTypes[ksp->normtype]);
+  }
+  
+  ierr       = KSPLogResidualHistory(ksp,dp);CHKERRQ(ierr);
+  ierr       = KSPMonitor(ksp,0,dp);CHKERRQ(ierr);
+  ksp->rnorm = dp;
+
+  ierr = (*ksp->converged)(ksp,0,dp,&ksp->reason,ksp->cnvP);CHKERRQ(ierr);      /* test for convergence */
+  if (ksp->reason) PetscFunctionReturn(0);
+
+  if (ksp->normtype != KSP_NORM_PRECONDITIONED && (ksp->normtype != KSP_NORM_NATURAL)) {
+    ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);                   /*     z <- Br         */
+  }
+  if (ksp->normtype != KSP_NORM_NATURAL) {
+    if (cg->singlereduction) {
+      ierr = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);
+      ierr = VecXDot(Z,S,&delta);CHKERRQ(ierr);
+    }
+    ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);         /*  beta <- z'*r       */
+    KSPCheckDot(ksp,beta);
+  }
+
+  /* Dingwen */
+  /* Checksum Initialization */
+  ierr = VecXDot(C1,X,&CKSX);CHKERRQ(ierr);						/* Compute the initial checksum(X) */ 
+  ierr = VecXDot(C1,W,&CKSW);CHKERRQ(ierr);						/* Compute the initial checksum(W) */
+  ierr = VecXDot(C1,R,&CKSR);CHKERRQ(ierr);						/* Compute the initial checksum(R) */
+  ierr = VecXDot(C1,Z,&CKSZ);CHKERRQ(ierr);						/* Compute the initial checksum(Z) */
+  ierr = KSP_MatMultTranspose(ksp,Amat,C1,CKSAmat);CHKERRQ(ierr);
+  /* Dingwen */
+  
+  struct timespec start, end;
+  struct timespec start_MVM, end_MVM;
+  long long int local_diff, global_diff;
+  long long int time_MVM = 0;
+  int num_MVM = 0;
+  
+  clock_gettime(CLOCK_REALTIME, &start);
+  i = 0;
+  do {
+	  if ((i>0)&&(i%(itv_c*itv_d) == 0))
+		{
+			ierr = VecCopy(X,CKPX);CHKERRQ(ierr);
+			ierr = VecCopy(P,CKPP);CHKERRQ(ierr);
+			CKPbetaold = betaold;
+			CKPi = i;
+		}
+	  ksp->its++;
+	  if (beta == 0.0) {
+      ksp->reason = KSP_CONVERGED_ATOL;
+      ierr        = PetscInfo(ksp,"converged due to beta = 0\n");CHKERRQ(ierr);
+      break;
+#if !defined(PETSC_USE_COMPLEX)
+    } else if ((i > 0) && (beta*betaold < 0.0)) {
+      ksp->reason = KSP_DIVERGED_INDEFINITE_PC;
+      ierr        = PetscInfo(ksp,"diverging due to indefinite preconditioner\n");CHKERRQ(ierr);
+      break;
+#endif
+    }
+    if (!i) {
+      ierr = VecCopy(Z,P);CHKERRQ(ierr);         /*     p <- z          */
+      b    = 0.0;
+	  /* Dingwen */
+	  ierr = VecXDot(C1,P, &CKSP);CHKERRQ(ierr);  				/* Compute the initial checksum(P) */
+	  /* Dingwen */
+    } else {
+      b = beta/betaold;
+      if (eigs) {
+        if (ksp->max_it != stored_max_it) SETERRQ(PetscObjectComm((PetscObject)ksp),PETSC_ERR_SUP,"Can not change maxit AND calculate eigenvalues");
+        e[i] = PetscSqrtReal(PetscAbsScalar(b))/a;
+      }
+      ierr = VecAYPX(P,b,Z);CHKERRQ(ierr);    /*     p <- z + b* p   */
+	  /* Dingwen */
+	  CKSP = CKSZ + b*CKSP;										/* Update checksum(P) = checksum(Z) + b*checksum(P); */
+	  
+	  ierr = VecXDot(C1,P, &sumP);CHKERRQ(ierr);
+	  if (PetscAbsScalar(CKSP-sumP)/n > 1.0e-6)				/* Check checksum(P) = sum(P) */
+	  {
+		  PetscPrintf(MPI_COMM_WORLD,"Recovery start...\n");
+		  PetscPrintf(MPI_COMM_WORLD,"Rollback from iteration-%d to iteration-%d\n",i,CKPi);
+		  betaold = CKPbetaold;										/* Recovery scalar betaold by checkpoint*/
+		  i = CKPi;													/* Recovery integer i by checkpoint */
+		  ierr = VecCopy(CKPP,P);CHKERRQ(ierr);						/* Recovery vector P from checkpoint */
+		  ierr = VecXDot(C1,P,&CKSP);CHKERRQ(ierr);					/* Recovery checksum(P) by P */ 
+		  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);			/* Recovery vector W by P */
+		  ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);					/* Recovery scalar dpi by P and W */
+		  ierr = VecCopy(CKPX,X);CHKERRQ(ierr);						/* Recovery vector X from checkpoint */
+		  ierr = VecXDot(C1,X,&CKSX);CHKERRQ(ierr);					/* Recovery checksum(X) by X */ 
+		  ierr = KSP_MatMult(ksp,Amat,X,R);CHKERRQ(ierr);			/* Recovery vector R by X */
+		  ierr = VecAYPX(R,-1.0,B);CHKERRQ(ierr);
+		  ierr = VecXDot(C1,R,&CKSR);CHKERRQ(ierr);					/* Recovery checksum(R) by R */
+		  ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);				/* Recovery vector Z by R */
+		  ierr = VecXDot(C1,Z,&CKSZ);CHKERRQ(ierr);					/* Recovery checksum(Z) by Z */
+		  ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);					/* Recovery scalar beta by Z and R */
+		  PetscPrintf(MPI_COMM_WORLD,"Recovery end.\n");
+
+		  /* Recover the calculations from iteration begining to checking */
+		  b = beta/betaold;
+		  ierr = VecAYPX(P,b,Z);CHKERRQ(ierr);    /*     p <- z + b* p   */	
+		  CKSP = CKSZ + b*CKSP;					/* Update checksum(P) = checksum(Z) + b*checksum(P); */
+	  }
+	  /* Dingwen */
+    }
+    dpiold = dpi;
+    if (!cg->singlereduction || !i) {
+	
+	  clock_gettime(CLOCK_REALTIME, &start_MVM);
+	  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);          /*     w <- Ap         */	/* MVM */
+	  clock_gettime(CLOCK_REALTIME, &end_MVM);
+	  time_MVM += 1000000000L*(end_MVM.tv_sec - start_MVM.tv_sec) + (end_MVM.tv_nsec - start_MVM	.tv_nsec);
+	  num_MVM++;
+  
+	  /* Dingwen */
+	  ierr = VecXDot(CKSAmat,P, &CKSW);CHKERRQ(ierr);
+	  
+	  /* Inject an error in W */
+	  if((i==inj_itr)&&(flag1)&&(error_type==1))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			W_SEQ;
+		  PetscScalar	*W_ARR;
+		  VecScatterCreateToAll(W,&ctx,&W_SEQ);
+		  VecScatterBegin(ctx,W,W_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,W,W_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(W_SEQ,&W_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= W_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(W,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&W_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(W);
+		  VecAssemblyEnd(W);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject an error in W of position-%d after MVM at iteration-%d\n", pos1,i);
+		  flag1	= PETSC_FALSE;
+	  }
+	  
+	  /* Inject two errors in W */
+	  if((i==inj_itr)&&(flag2)&(error_type==2))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			W_SEQ;
+		  PetscScalar	*W_ARR;
+		  VecScatterCreateToAll(W,&ctx,&W_SEQ);
+		  VecScatterBegin(ctx,W,W_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,W,W_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(W_SEQ,&W_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= W_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(W,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  pos2 = rand()/(RAND_MAX/n+1);
+		  v		= W_ARR[pos2]*inj_times;
+		  ierr	= VecSetValues(W,1,&pos2,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&W_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(W);
+		  VecAssemblyEnd(W);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject two errors in W of position-%d and position-%d after MVM at iteration-%d\n", pos1,pos2,i);
+		  flag2	= PETSC_FALSE;
+		}
+		
+		ierr = VecXDot(C1,W, &sumW);CHKERRQ(ierr);
+	  if (PetscAbsScalar(CKSW-sumW)/ n > 1.0e-6)				/* Check checksum(W) = sum(W) */
+	  {
+		  PetscPrintf(MPI_COMM_WORLD,"Recovery start...\n");
+		  PetscPrintf(MPI_COMM_WORLD,"Rollback from iteration-%d to iteration-%d\n",i,CKPi);
+		  betaold = CKPbetaold;										/* Recovery scalar betaold by checkpoint*/
+		  i = CKPi;													/* Recovery integer i by checkpoint */
+		  ierr = VecCopy(CKPP,P);CHKERRQ(ierr);						/* Recovery vector P from checkpoint */
+		  ierr = VecXDot(C1,P,&CKSP);CHKERRQ(ierr);					/* Recovery checksum(P) by P */ 
+		  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);			/* Recovery vector W by P */
+		  ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);					/* Recovery scalar dpi by P and W */
+		  ierr = VecCopy(CKPX,X);CHKERRQ(ierr);						/* Recovery vector X from checkpoint */
+		  ierr = VecXDot(C1,X,&CKSX);CHKERRQ(ierr);					/* Recovery checksum(X) by X */ 
+		  ierr = KSP_MatMult(ksp,Amat,X,R);CHKERRQ(ierr);			/* Recovery vector R by X */
+		  ierr = VecAYPX(R,-1.0,B);CHKERRQ(ierr);
+		  ierr = VecXDot(C1,R,&CKSR);CHKERRQ(ierr);					/* Recovery checksum(R) by R */
+		  ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);				/* Recovery vector Z by R */
+		  ierr = VecXDot(C1,Z,&CKSZ);CHKERRQ(ierr);					/* Recovery checksum(Z) by Z */
+		  ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);					/* Recovery scalar beta by Z and R */
+		  PetscPrintf(MPI_COMM_WORLD,"Recovery end.\n");
+
+		  /* Recover the calculations from iteration begining to checking */
+		  b = beta/betaold;
+		  ierr = VecAYPX(P,b,Z);CHKERRQ(ierr);    /*     p <- z + b* p   */
+		  CKSP = CKSZ + b*CKSP;										/* Update checksum(P) = checksum(Z) + b*checksum(P); */
+		  dpiold = dpi;
+		  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);          /*     w <- Ap         */	/* MVM */
+		  ierr = VecXDot(CKSAmat,P, &CKSW);CHKERRQ(ierr);
+	  }	  
+	  /* Dingwen */
+	  
+	  ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);                  /*     dpi <- p'w     */	  
+	  
+    } else {
+      ierr = VecAYPX(W,beta/betaold,S);CHKERRQ(ierr);                  /*     w <- Ap         */
+      dpi  = delta - beta*beta*dpiold/(betaold*betaold);             /*     dpi <- p'w     */
+	}
+    betaold = beta;
+    KSPCheckDot(ksp,beta);
+
+    if ((dpi == 0.0) || ((i > 0) && (PetscRealPart(dpi*dpiold) <= 0.0))) {
+      ksp->reason = KSP_DIVERGED_INDEFINITE_MAT;
+      ierr        = PetscInfo(ksp,"diverging due to indefinite or negative definite matrix\n");CHKERRQ(ierr);
+      break;
+    }
+    a = beta/dpi;                                 /*     a = beta/p'w   */
+    if (eigs) d[i] = PetscSqrtReal(PetscAbsScalar(b))*e[i] + 1.0/a;
+    ierr = VecAXPY(X,a,P);CHKERRQ(ierr);          /*     x <- x + ap     */
+	/* Dingwen */
+	CKSX = CKSX + a*CKSP;									/* Update checksum(X) = checksum(X) + a*checksum(P); */
+	
+	ierr = VecXDot(C1,X, &sumX);CHKERRQ(ierr);
+	  if (PetscAbsScalar(CKSX-sumX)/n > 1.0e-6)			/* Check checksum(X) = sum(X) */
+	  {
+		  PetscPrintf(MPI_COMM_WORLD,"Recovery start...\n");
+		  PetscPrintf(MPI_COMM_WORLD,"Rollback from iteration-%d to iteration-%d\n",i,CKPi);
+		  betaold = CKPbetaold;										/* Recovery scalar betaold by checkpoint*/
+		  i = CKPi;													/* Recovery integer i by checkpoint */
+		  ierr = VecCopy(CKPP,P);CHKERRQ(ierr);						/* Recovery vector P from checkpoint */
+		  ierr = VecXDot(C1,P,&CKSP);CHKERRQ(ierr);					/* Recovery checksum(P) by P */ 
+		  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);			/* Recovery vector W by P */
+		  ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);					/* Recovery scalar dpi by P and W */
+		  ierr = VecCopy(CKPX,X);CHKERRQ(ierr);						/* Recovery vector X from checkpoint */
+		  ierr = VecXDot(C1,X,&CKSX);CHKERRQ(ierr);					/* Recovery checksum(X) by X */ 
+		  ierr = KSP_MatMult(ksp,Amat,X,R);CHKERRQ(ierr);			/* Recovery vector R by X */
+		  ierr = VecAYPX(R,-1.0,B);CHKERRQ(ierr);
+		  ierr = VecXDot(C1,R,&CKSR);CHKERRQ(ierr);					/* Recovery checksum(R) by R */
+		  ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);				/* Recovery vector Z by R */
+		  ierr = VecXDot(C1,Z,&CKSZ);CHKERRQ(ierr);					/* Recovery checksum(Z) by Z */
+		  ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);					/* Recovery scalar beta by Z and R */
+		  PetscPrintf(MPI_COMM_WORLD,"Recovery end.\n");
+
+		  /* Recover the calculations from iteration begining to checking */
+		  b = beta/betaold;
+		  ierr = VecAYPX(P,b,Z);CHKERRQ(ierr);    /*     p <- z + b* p   */
+		  CKSP = CKSZ + b*CKSP;										/* Update checksum(P) = checksum(Z) + b*checksum(P); */
+		  dpiold = dpi;
+		  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);          /*     w <- Ap         */	/* MVM */
+		  ierr = VecXDot(CKSAmat,P, &CKSW);CHKERRQ(ierr);
+		  ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);                  /*     dpi <- p'w     */	  
+		  betaold = beta;
+		  a = beta/dpi;                                 /*     a = beta/p'w   */
+		  ierr = VecAXPY(X,a,P);CHKERRQ(ierr);          /*     x <- x + ap     */
+		  CKSX = CKSX + a*CKSP;									/* Update checksum(X) = checksum(X) + a*checksum(P); */
+	  }
+
+	/* Dingwen */
+    
+	ierr = VecAXPY(R,-a,W);CHKERRQ(ierr);                      /*     r <- r - aw    */
+
+	/* Dingwen */
+	CKSR = CKSR - a*CKSW;									/* Update checksum(R) = checksum(R) - a*checksum(W); */
+	
+	ierr = VecXDot(C1,R, &sumR);CHKERRQ(ierr);
+	if (PetscAbsScalar(CKSR-sumR)/n > 1.0e-6)			/* Check checksum(R) = sum(R) */
+	{
+		  PetscPrintf(MPI_COMM_WORLD,"Recovery start...\n");
+		  PetscPrintf(MPI_COMM_WORLD,"Rollback from iteration-%d to iteration-%d\n",i,CKPi);
+		  betaold = CKPbetaold;										/* Recovery scalar betaold by checkpoint*/
+		  i = CKPi;													/* Recovery integer i by checkpoint */
+		  ierr = VecCopy(CKPP,P);CHKERRQ(ierr);						/* Recovery vector P from checkpoint */
+		  ierr = VecXDot(C1,P,&CKSP);CHKERRQ(ierr);					/* Recovery checksum(P) by P */ 
+		  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);			/* Recovery vector W by P */
+		  ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);					/* Recovery scalar dpi by P and W */
+		  ierr = VecCopy(CKPX,X);CHKERRQ(ierr);						/* Recovery vector X from checkpoint */
+		  ierr = VecXDot(C1,X,&CKSX);CHKERRQ(ierr);					/* Recovery checksum(X) by X */ 
+		  ierr = KSP_MatMult(ksp,Amat,X,R);CHKERRQ(ierr);			/* Recovery vector R by X */
+		  ierr = VecAYPX(R,-1.0,B);CHKERRQ(ierr);
+		  ierr = VecXDot(C1,R,&CKSR);CHKERRQ(ierr);					/* Recovery checksum(R) by R */
+		  ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);				/* Recovery vector Z by R */
+		  ierr = VecXDot(C1,Z,&CKSZ);CHKERRQ(ierr);					/* Recovery checksum(Z) by Z */
+		  ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);					/* Recovery scalar beta by Z and R */
+		  PetscPrintf(MPI_COMM_WORLD,"Recovery end.\n");
+
+		  /* Recover the calculations from iteration begining to checking */
+		  b = beta/betaold;
+		  ierr = VecAYPX(P,b,Z);CHKERRQ(ierr);    /*     p <- z + b* p   */
+		  CKSP = CKSZ + b*CKSP;										/* Update checksum(P) = checksum(Z) + b*checksum(P); */
+		  dpiold = dpi;
+		  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);          /*     w <- Ap         */	/* MVM */
+		  ierr = VecXDot(CKSAmat,P, &CKSW);CHKERRQ(ierr);
+		  ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);                  /*     dpi <- p'w     */	  
+		  betaold = beta;
+		  a = beta/dpi;                                 /*     a = beta/p'w   */
+		  ierr = VecAXPY(X,a,P);CHKERRQ(ierr);          /*     x <- x + ap     */
+		  CKSX = CKSX + a*CKSP;									/* Update checksum(X) = checksum(X) + a*checksum(P); */
+		  ierr = VecAXPY(R,-a,W);CHKERRQ(ierr);                      /*     r <- r - aw    */
+		  CKSR = CKSR - a*CKSW;									/* Update checksum(R) = checksum(R) - a*checksum(W); */
+	}
+	/* Dingwen */
+	
+	if (ksp->normtype == KSP_NORM_PRECONDITIONED && ksp->chknorm < i+2) {      
+	  ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);               /*     z <- Br         */
+	  
+	  /* Dingwen */
+	  ierr = VecXDot(C1,Z, &CKSZ);CHKERRQ(ierr);				/* Update checksum(Z) */
+	  /* Dingwen */
+	  
+	  if (cg->singlereduction) {
+        ierr = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);			/* MVM */
       }
       ierr = VecNorm(Z,NORM_2,&dp);CHKERRQ(ierr);              /*    dp <- z'*z       */
     } else if (ksp->normtype == KSP_NORM_UNPRECONDITIONED && ksp->chknorm < i+2) {
@@ -407,25 +1319,923 @@ PetscErrorCode  KSPSolve_CG(KSP ksp)
 	
 	/* Dingwen */
 	/* Inject error */
-	if ((i==50) && (flag))
-	{
-		v	 	= 1000;
-		ierr	= VecSet(X,v);CHKERRQ(ierr);
-		flag	= PETSC_FALSE;
-		printf ("Inject an error in vector X at the end of iteration-%d\n", i-1);
-		PetscBarrier(X);
+	  /* Inject an error in P */
+	  if((i==inj_itr)&&(flag3)&&(error_type==3))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			P_SEQ;
+		  PetscScalar	*P_ARR;
+		  VecScatterCreateToAll(P,&ctx,&P_SEQ);
+		  VecScatterBegin(ctx,P,P_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,P,P_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(P_SEQ,&P_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= P_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(P,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&P_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(P);
+		  VecAssemblyEnd(P);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject an error in P of position-%d at the end of iteration-%d\n", pos1,i);
+		  flag3	= PETSC_FALSE;
+	  }
+	  
+	  /* Inject two errors in P */
+	  if((i==inj_itr)&&(flag4)&(error_type==4))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			P_SEQ;
+		  PetscScalar	*P_ARR;
+		  VecScatterCreateToAll(P,&ctx,&P_SEQ);
+		  VecScatterBegin(ctx,P,P_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,P,P_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(P_SEQ,&P_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= P_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(P,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  pos2 = rand()/(RAND_MAX/n+1);
+		  v		= P_ARR[pos2]*inj_times;
+		  ierr	= VecSetValues(P,1,&pos2,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&P_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(P);
+		  VecAssemblyEnd(P);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject two errors in P of position-%d and position-%d at the end of iteration-%d\n", pos1,pos2,i);
+		  flag4	= PETSC_FALSE;
+		}
+		
+		/* Inject an error in X*/
+	  if((i==inj_itr)&&(flag5)&&(error_type==5))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			X_SEQ;
+		  PetscScalar	*X_ARR;
+		  VecScatterCreateToAll(X,&ctx,&X_SEQ);
+		  VecScatterBegin(ctx,X,X_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,X,X_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(X_SEQ,&X_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= X_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(X,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&X_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(X);
+		  VecAssemblyEnd(X);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject an error in X of position-%d at the end of iteration-%d\n", pos1,i);
+		  flag5	= PETSC_FALSE;
+	  }
+	  
+	  /* Inject two errors in X*/
+	  if((i==inj_itr)&&(flag6)&&(error_type==6))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			X_SEQ;
+		  PetscScalar	*X_ARR;
+		  VecScatterCreateToAll(X,&ctx,&X_SEQ);
+		  VecScatterBegin(ctx,X,X_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,X,X_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(X_SEQ,&X_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= X_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(X,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  pos2 = rand()/(RAND_MAX/n+1);
+		  v		= X_ARR[pos2]*inj_times;
+		  ierr	= VecSetValues(X,1,&pos2,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&X_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(X);
+		  VecAssemblyEnd(X);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject two errors in X of position-%d and position-%d at the end of iteration-%d\n", pos1,pos2,i);
+		  flag6	= PETSC_FALSE;
+		}
+		
+		/* Inject an error in R */
+	  if((i==inj_itr)&&(flag7)&&(error_type==7))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			R_SEQ;
+		  PetscScalar	*R_ARR;
+		  VecScatterCreateToAll(R,&ctx,&R_SEQ);
+		  VecScatterBegin(ctx,R,R_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,R,R_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(R_SEQ,&R_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= R_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(R,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&R_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(R);
+		  VecAssemblyEnd(R);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject an error in R of position-%d at the end of iteration-%d\n", pos1,i);
+		  flag7	= PETSC_FALSE;
+	  }
+	  
+	  /* Inject two errors */
+	  if((i==inj_itr)&&(flag8)&&(error_type==8))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			R_SEQ;
+		  PetscScalar	*R_ARR;
+		  VecScatterCreateToAll(R,&ctx,&R_SEQ);
+		  VecScatterBegin(ctx,R,R_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,R,R_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(R_SEQ,&R_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= R_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(R,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  pos2 = rand()/(RAND_MAX/n+1);
+		  v		= R_ARR[pos2]*inj_times;
+		  ierr	= VecSetValues(R,1,&pos2,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&R_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(R);
+		  VecAssemblyEnd(R);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject two errors in R of position-%d and position-%d at the end of iteration-%d\n", pos1,pos2,i);
+		  flag8	= PETSC_FALSE;
+		}
+		
+		/* Inject an error in Z */
+	  if((i==inj_itr)&&(flag9)&&(error_type==9))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			Z_SEQ;
+		  PetscScalar	*Z_ARR;
+		  VecScatterCreateToAll(Z,&ctx,&Z_SEQ);
+		  VecScatterBegin(ctx,Z,Z_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,Z,Z_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(Z_SEQ,&Z_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= Z_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(Z,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&Z_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(Z);
+		  VecAssemblyEnd(Z);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject an error in Z of position-%d at the end of iteration-%d\n", pos1,i);
+		  flag9	= PETSC_FALSE;
+	  }
+	  
+	  /* Inject two errors */
+	  if((i==inj_itr)&&(flag10)&&(error_type==10))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			Z_SEQ;
+		  PetscScalar	*Z_ARR;
+		  VecScatterCreateToAll(Z,&ctx,&Z_SEQ);
+		  VecScatterBegin(ctx,Z,Z_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,Z,Z_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(Z_SEQ,&Z_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= Z_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(Z,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  pos2 = rand()/(RAND_MAX/n+1);
+		  v		= Z_ARR[pos2]*inj_times;
+		  ierr	= VecSetValues(Z,1,&pos2,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&Z_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(Z);
+		  VecAssemblyEnd(Z);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject two errors in Z of position-%d and position-%d at the end of iteration-%d\n", pos1,pos2,i);
+		  flag10	= PETSC_FALSE;
+		}
+	/* Dingwen */
+	
+  } while (i<ksp->max_it);
+  clock_gettime(CLOCK_REALTIME, &end);
+  local_diff = 1000000000L*(end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec);
+  MPI_Reduce(&local_diff, &global_diff, 1, MPI_LONG_LONG_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+  PetscPrintf(MPI_COMM_WORLD,"Average time of each MVM = %lf nanoseconds\n",(double)(time_MVM)/num_MVM);
+  PetscPrintf(MPI_COMM_WORLD,"Elapsed time of main loop = %lf nanoseconds\n", (double)(global_diff)/size);
+  PetscPrintf(MPI_COMM_WORLD,"Number of iterations without rollback = %d\n", i+1);	  
+  }
+
+  if (solver_type==3)
+  {
+	    cg            = (KSP_CG*)ksp->data;
+  eigs          = ksp->calc_sings;
+  stored_max_it = ksp->max_it;
+  X             = ksp->vec_sol;
+  B             = ksp->vec_rhs;
+  R             = ksp->work[0];
+  Z             = ksp->work[1];
+  P             = ksp->work[2];
+  /* Dingwen */
+  CKPX			= ksp->work[3];
+  CKPP			= ksp->work[4];
+  CKSAmat1		= ksp->work[5];
+  CKSAmat2		= ksp->work[6];
+  CKSAmat3		= ksp->work[7];
+  C1			= ksp->work[8];
+  C2			= ksp->work[9];
+  C3			= ksp->work[10];
+  /* Dingwen */
+  
+  if (cg->singlereduction) {
+    S = ksp->work[11];
+    W = ksp->work[12];
+  } else {
+    S = 0;                      /* unused */
+    W = Z;
+  }
+    
+  if (eigs) {e = cg->e; d = cg->d; e[0] = 0.0; }
+  ierr = PCGetOperators(ksp->pc,&Amat,&Pmat);CHKERRQ(ierr);
+  
+  ksp->its = 0;
+  if (!ksp->guess_zero) {
+    ierr = KSP_MatMult(ksp,Amat,X,R);CHKERRQ(ierr);            /*     r <- b - Ax     */
+    ierr = VecAYPX(R,-1.0,B);CHKERRQ(ierr);
+  } else {
+    ierr = VecCopy(B,R);CHKERRQ(ierr);                         /*     r <- b (x is 0) */
+  }
+	
+  switch (ksp->normtype) {
+  case KSP_NORM_PRECONDITIONED:
+    ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);                   /*     z <- Br         */
+    ierr = VecNorm(Z,NORM_2,&dp);CHKERRQ(ierr);                /*    dp <- z'*z = e'*A'*B'*B*A'*e'     */
+    break;
+  case KSP_NORM_UNPRECONDITIONED:
+    ierr = VecNorm(R,NORM_2,&dp);CHKERRQ(ierr);                /*    dp <- r'*r = e'*A'*A*e            */
+    break;
+  case KSP_NORM_NATURAL:
+    ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);                   /*     z <- Br         */
+    if (cg->singlereduction) {
+      ierr = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);
+      ierr = VecXDot(Z,S,&delta);CHKERRQ(ierr);
+	  /* Dingwen */
+	  ierr = VecXDot(C1,S,&CKSS1);CHKERRQ(ierr);						/* Compute the initial checksum1(S) */
+	  ierr = VecXDot(C2,S,&CKSS2);CHKERRQ(ierr);						/* Compute the initial checksum2(S) */
+	  ierr = VecXDot(C3,S,&CKSS3);CHKERRQ(ierr);						/* Compute the initial checksum3(S) */
+	  /* Dingwen */
 	}
+    ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);                     /*  beta <- z'*r       */
+    KSPCheckDot(ksp,beta);
+    dp = PetscSqrtReal(PetscAbsScalar(beta));                           /*    dp <- r'*z = r'*B*r = e'*A'*B*A*e */
+    break;
+  case KSP_NORM_NONE:
+    dp = 0.0;
+    break;
+  default: SETERRQ1(PetscObjectComm((PetscObject)ksp),PETSC_ERR_SUP,"%s",KSPNormTypes[ksp->normtype]);
+  }
+  
+  ierr       = KSPLogResidualHistory(ksp,dp);CHKERRQ(ierr);
+  ierr       = KSPMonitor(ksp,0,dp);CHKERRQ(ierr);
+  ksp->rnorm = dp;
+
+  ierr = (*ksp->converged)(ksp,0,dp,&ksp->reason,ksp->cnvP);CHKERRQ(ierr);      /* test for convergence */
+  if (ksp->reason) PetscFunctionReturn(0);
+
+  if (ksp->normtype != KSP_NORM_PRECONDITIONED && (ksp->normtype != KSP_NORM_NATURAL)) {
+    ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);                   /*     z <- Br         */
+  }
+  if (ksp->normtype != KSP_NORM_NATURAL) {
+    if (cg->singlereduction) {
+      ierr = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);
+      ierr = VecXDot(Z,S,&delta);CHKERRQ(ierr);
+    }
+    ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);         /*  beta <- z'*r       */
+    KSPCheckDot(ksp,beta);
+  }
+
+  /* Dingwen */
+  /* checksum coefficients initialization */
+  PetscInt n;
+  PetscInt *index;
+  PetscScalar *v1,*v2,*v3;
+  ierr = VecGetSize(B,&n);
+  v1 	= (PetscScalar *)malloc(n*sizeof(PetscScalar));
+  v2 	= (PetscScalar *)malloc(n*sizeof(PetscScalar));
+  v3 	= (PetscScalar *)malloc(n*sizeof(PetscScalar));
+  index	= (PetscInt *)malloc(n*sizeof(PetscInt));
+  for (i=0; i<n; i++)
+  {
+	  index[i] = i;
+	  v1[i] = 1.0;
+	  v2[i] = i+1.0;
+	  v3[i] = 1/(i+1.0);
+  }
+  ierr	= VecSetValues(C1,n,index,v1,INSERT_VALUES);CHKERRQ(ierr);	
+  ierr 	= VecSetValues(C2,n,index,v2,INSERT_VALUES);CHKERRQ(ierr);
+  ierr	= VecSetValues(C3,n,index,v3,INSERT_VALUES);CHKERRQ(ierr);	
+  d1 = 1.0;
+  d2 = 2.0;
+  d3 = 3.0;
+  ierr = KSP_MatMultTranspose(ksp,Amat,C1,CKSAmat1);CHKERRQ(ierr);
+  ierr = VecAXPY(CKSAmat1,-d1,C1);CHKERRQ(ierr);
+  ierr = VecAXPY(CKSAmat1,-d2,C2);CHKERRQ(ierr); 
+  ierr = VecAXPY(CKSAmat1,-d3,C3);CHKERRQ(ierr);					/* Compute the initial checksum1(A) */ 
+  ierr = KSP_MatMultTranspose(ksp,Amat,C2,CKSAmat2);CHKERRQ(ierr);
+  ierr = VecAXPY(CKSAmat2,-d2,C1);CHKERRQ(ierr);
+  ierr = VecAXPY(CKSAmat2,-d3,C2);CHKERRQ(ierr);
+  ierr = VecAXPY(CKSAmat2,-d1,C3);CHKERRQ(ierr);					/* Compute the initial checksum2(A) */ 
+  ierr = KSP_MatMultTranspose(ksp,Amat,C3,CKSAmat3);CHKERRQ(ierr);
+  ierr = VecAXPY(CKSAmat3,-d3,C1);CHKERRQ(ierr);
+  ierr = VecAXPY(CKSAmat3,-d1,C2);CHKERRQ(ierr);
+  ierr = VecAXPY(CKSAmat3,-d2,C3);CHKERRQ(ierr);					/* Compute the initial checksum3(A) */
+  /* Checksum Initialization */
+  ierr = VecXDot(C1,X,&CKSX1);CHKERRQ(ierr);						/* Compute the initial checksum1(X) */ 
+  ierr = VecXDot(C1,R,&CKSR1);CHKERRQ(ierr);						/* Compute the initial checksum1(R) */
+  ierr = VecXDot(C1,Z,&CKSZ1);CHKERRQ(ierr);						/* Compute the initial checksum1(Z) */
+  ierr = VecXDot(C2,X,&CKSX2);CHKERRQ(ierr);						/* Compute the initial checksum2(X) */ 
+  ierr = VecXDot(C2,R,&CKSR2);CHKERRQ(ierr);						/* Compute the initial checksum2(R) */
+  ierr = VecXDot(C2,Z,&CKSZ2);CHKERRQ(ierr);						/* Compute the initial checksum2(Z) */
+  ierr = VecXDot(C3,X,&CKSX3);CHKERRQ(ierr);						/* Compute the initial checksum3(X) */ 
+  ierr = VecXDot(C3,R,&CKSR3);CHKERRQ(ierr);						/* Compute the initial checksum3(R) */
+  ierr = VecXDot(C3,Z,&CKSZ3);CHKERRQ(ierr);						/* Compute the initial checksum3(Z) */
+
+  struct timespec start, end;
+  long long int local_diff, global_diff;
+  clock_gettime(CLOCK_REALTIME, &start);
+  
+  i = 0;
+  do {
+	  /* Dingwen */
+	  if ((i>0) && (i%itv_d == 0))
+	  {
+		  PetscScalar	sumX1,sumR1;
+		  ierr = VecXDot(C1,X,&sumX1);CHKERRQ(ierr);
+		  ierr = VecXDot(C1,R,&sumR1);CHKERRQ(ierr);
+		  if ((PetscAbsScalar(sumX1-CKSX1)/(n*n) > 1.0e-6) || (PetscAbsScalar(sumR1-CKSR1)/(n*n) > 1.0e-6))
+		  {
+			  /* Rollback and Recovery */
+			  PetscPrintf (MPI_COMM_WORLD,"Recovery start...\n");
+			  PetscPrintf (MPI_COMM_WORLD,"Rollback from iteration-%d to iteration-%d\n",i,CKPi);
+			  betaold = CKPbetaold;									/* Recovery scalar betaold by checkpoint*/
+			  i = CKPi;													/* Recovery integer i by checkpoint */
+			  ierr = VecCopy(CKPP,P);CHKERRQ(ierr);						/* Recovery vector P from checkpoint */
+			  ierr = VecXDot(C1,P,&CKSP1);CHKERRQ(ierr);				/* Recovery checksum1(P) by P */	
+			  ierr = VecXDot(C2,P,&CKSP2);CHKERRQ(ierr);				/* Recovery checksum2(P) by P */			  
+			  ierr = VecXDot(C3,P,&CKSP3);CHKERRQ(ierr);				/* Recovery checksum3(P) by P */
+			  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);			/* Recovery vector W by P */
+			  ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);					/* Recovery scalar dpi by P and W */
+			  ierr = VecCopy(CKPX,X);CHKERRQ(ierr);						/* Recovery vector X from checkpoint */
+			  ierr = VecXDot(C1,X,&CKSX1);CHKERRQ(ierr);				/* Recovery checksum1(X) by X */
+			  ierr = VecXDot(C2,X,&CKSX2);CHKERRQ(ierr);				/* Recovery checksum2(X) by X */ 			  
+			  ierr = VecXDot(C3,X,&CKSX3);CHKERRQ(ierr);				/* Recovery checksum3(X) by X */ 			  
+			  ierr = KSP_MatMult(ksp,Amat,X,R);CHKERRQ(ierr);			/* Recovery vector R by X */
+			  ierr = VecAYPX(R,-1.0,B);CHKERRQ(ierr);
+			  ierr = VecXDot(C1,R,&CKSR1);CHKERRQ(ierr);				/* Recovery checksum1(R) by R */
+			  ierr = VecXDot(C2,R,&CKSR2);CHKERRQ(ierr);				/* Recovery checksum2(R) by R */
+			  ierr = VecXDot(C3,R,&CKSR3);CHKERRQ(ierr);				/* Recovery checksum3(R) by R */
+			  ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);				/* Recovery vector Z by R */
+			  ierr = VecXDot(C1,Z,&CKSZ1);CHKERRQ(ierr);				/* Recovery checksum1(Z) by Z */
+			  ierr = VecXDot(C2,Z,&CKSZ2);CHKERRQ(ierr);				/* Recovery checksum2(Z) by Z */
+			  ierr = VecXDot(C3,Z,&CKSZ3);CHKERRQ(ierr);				/* Recovery checksum3(Z) by Z */
+			  ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);					/* Recovery scalar beta by Z and R */
+			  PetscPrintf (MPI_COMM_WORLD,"Recovery end.\n");
+		}
+		else if (i%(itv_c*itv_d) == 0)
+		{
+			ierr = VecCopy(X,CKPX);CHKERRQ(ierr);
+			ierr = VecCopy(P,CKPP);CHKERRQ(ierr);
+			CKPbetaold = betaold;
+			CKPi = i;
+		}
+	}
+	  //ksp->its = i+1;
+	  ksp->its++;
+	  if (beta == 0.0) {
+      ksp->reason = KSP_CONVERGED_ATOL;
+      ierr        = PetscInfo(ksp,"converged due to beta = 0\n");CHKERRQ(ierr);
+      break;
+#if !defined(PETSC_USE_COMPLEX)
+    } else if ((i > 0) && (beta*betaold < 0.0)) {
+      ksp->reason = KSP_DIVERGED_INDEFINITE_PC;
+      ierr        = PetscInfo(ksp,"diverging due to indefinite preconditioner\n");CHKERRQ(ierr);
+      break;
+#endif
+    }
+    if (!i) {
+      ierr = VecCopy(Z,P);CHKERRQ(ierr);         /*     p <- z          */
+      b    = 0.0;
+	  /* Dingwen */
+	  ierr = VecXDot(C1,P, &CKSP1);CHKERRQ(ierr);  				/* Compute the initial checksum1(P) */
+	  ierr = VecXDot(C2,P, &CKSP2);CHKERRQ(ierr);  				/* Compute the initial checksum2(P) */
+	  ierr = VecXDot(C3,P, &CKSP3);CHKERRQ(ierr);  				/* Compute the initial checksum3(P) */
+	  /* Dingwen */
+    } else {
+      b = beta/betaold;
+      if (eigs) {
+        if (ksp->max_it != stored_max_it) SETERRQ(PetscObjectComm((PetscObject)ksp),PETSC_ERR_SUP,"Can not change maxit AND calculate eigenvalues");
+        e[i] = PetscSqrtReal(PetscAbsScalar(b))/a;
+      }
+      ierr = VecAYPX(P,b,Z);CHKERRQ(ierr);    /*     p <- z + b* p   */	  
+	  /* Dingwen */
+	  CKSP1 = CKSZ1 + b*CKSP1;										/* Update checksum1(P) = checksum1(Z) + b*checksum1(P); */
+	  CKSP2 = CKSZ2 + b*CKSP2;										/* Update checksum2(P) = checksum2(Z) + b*checksum2(P); */
+	  CKSP3 = CKSZ3 + b*CKSP3;										/* Update checksum3(P) = checksum3(Z) + b*checksum3(P); */
+	  /* Dingwen */
+    }
+    dpiold = dpi;
+    if (!cg->singlereduction || !i) {	  
+	  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);          /*     w <- Ap         */	/* MVM */
+      ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);                  /*     dpi <- p'w     */	  
+	  
+	  /* Dingwen */
+	  ierr = VecXDot(CKSAmat1, P, &CKSW1);CHKERRQ(ierr);
+	  CKSW1 = CKSW1 + d1*CKSP1 + d2*CKSP2 + d3*CKSP3;									/* Update checksum1(W) = checksum1(A)P + d1*checksum1(P) + d2*checksum2(P) + d3*checksum3(P); */
+	  ierr = VecXDot(CKSAmat2, P, &CKSW2);CHKERRQ(ierr);
+	  CKSW2 = CKSW2 + d2*CKSP1 + d3*CKSP2 + d1*CKSP3;									/* Update checksum2(W) = checksum2(A)P + d2*checksum1(P) + d3*checksum2(P) + d1*checksum3(P); */
+	  ierr = VecXDot(CKSAmat3, P, &CKSW3);CHKERRQ(ierr);
+	  CKSW3 = CKSW3 + d3*CKSP1 + d1*CKSP2 + d2*CKSP3;									/* Update checksum3(W) = checksum3(A)P + d3*checksum1(P) + d1*checksum2(P) + d2*checksum3(P); */
+
+	  /* Inject an error */
+	  if((i==inj_itr)&&(flag1)&&(error_type==1))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			W_SEQ;
+		  PetscScalar	*W_ARR;
+		  VecScatterCreateToAll(W,&ctx,&W_SEQ);
+		  VecScatterBegin(ctx,W,W_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,W,W_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(W_SEQ,&W_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= W_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(W,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&W_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(W);
+		  VecAssemblyEnd(W);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject an error in W of position-%d after MVM at iteration-%d\n", pos1,i);
+		  flag1	= PETSC_FALSE;
+	  }
+	  
+	  /* Inject two errors */
+	  if((i==inj_itr)&&(flag2)&&(error_type==2))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			W_SEQ;
+		  PetscScalar	*W_ARR;
+		  VecScatterCreateToAll(W,&ctx,&W_SEQ);
+		  VecScatterBegin(ctx,W,W_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,W,W_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(W_SEQ,&W_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= W_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(W,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  pos2 = rand()/(RAND_MAX/n+1);
+		  v		= W_ARR[pos2]*inj_times;
+		  ierr	= VecSetValues(W,1,&pos2,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&W_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(W);
+		  VecAssemblyEnd(W);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject two errors in W of position-%d and position-%d after MVM at iteration-%d\n", pos1,pos2,i);
+		  flag2	= PETSC_FALSE;
+		}
+
+	  /* Inner Protection */
+	  PetscScalar delta1,delta2,delta3;			  
+	  PetscScalar sumW1,sumW2,sumW3;	  
+	  ierr = VecXDot(C1,W,&sumW1);CHKERRQ(ierr);
+	  ierr = VecXDot(C2,W,&sumW2);CHKERRQ(ierr);
+	  ierr = VecXDot(C3,W,&sumW3);CHKERRQ(ierr);
+	  delta1 = sumW1 - CKSW1;
+	  delta2 = sumW2 - CKSW2;
+	  delta3 = sumW3 - CKSW3;
+	  if (PetscAbsScalar(delta1)/(n*n) > 1.0e-6)
+	  {
+		  PetscScalar sumP1;
+		  ierr = VecXDot(C1,P,&sumP1);CHKERRQ(ierr);
+		  if (PetscAbsScalar(CKSP1-sumP1)/(n*n) > 1.0e-6)
+		  {
+			  /* Rollback and Recovery */
+			  PetscPrintf(MPI_COMM_WORLD,"Errors occur before MVM\n");
+			  PetscPrintf(MPI_COMM_WORLD,"Recovery start...\n");
+			  PetscPrintf(MPI_COMM_WORLD,"Rollback from iteration-%d to iteration-%d\n",i,CKPi);
+			  betaold = CKPbetaold;										/* Recovery scalar betaold by checkpoint*/
+			  i = CKPi;													/* Recovery integer i by checkpoint */
+			  ierr = VecCopy(CKPP,P);CHKERRQ(ierr);						/* Recovery vector P from checkpoint */
+			  ierr = VecXDot(C1,P,&CKSP1);CHKERRQ(ierr);				/* Recovery checksum1(P) by P */	
+			  ierr = VecXDot(C2,P,&CKSP2);CHKERRQ(ierr);				/* Recovery checksum2(P) by P */			  
+			  ierr = VecXDot(C3,P,&CKSP3);CHKERRQ(ierr);				/* Recovery checksum3(P) by P */
+			  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);			/* Recovery vector W by P */
+			  ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);					/* Recovery scalar dpi by P and W */
+			  ierr = VecCopy(CKPX,X);CHKERRQ(ierr);						/* Recovery vector X from checkpoint */
+			  ierr = VecXDot(C1,X,&CKSX1);CHKERRQ(ierr);				/* Recovery checksum1(X) by X */
+			  ierr = VecXDot(C2,X,&CKSX2);CHKERRQ(ierr);				/* Recovery checksum2(X) by X */ 			  
+			  ierr = VecXDot(C3,X,&CKSX3);CHKERRQ(ierr);				/* Recovery checksum3(X) by X */ 			  
+			  ierr = KSP_MatMult(ksp,Amat,X,R);CHKERRQ(ierr);			/* Recovery vector R by X */
+			  ierr = VecAYPX(R,-1.0,B);CHKERRQ(ierr);
+			  ierr = VecXDot(C1,R,&CKSR1);CHKERRQ(ierr);				/* Recovery checksum1(R) by R */
+			  ierr = VecXDot(C2,R,&CKSR2);CHKERRQ(ierr);				/* Recovery checksum2(R) by R */
+			  ierr = VecXDot(C3,R,&CKSR3);CHKERRQ(ierr);				/* Recovery checksum3(R) by R */
+			  ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);				/* Recovery vector Z by R */
+			  ierr = VecXDot(C1,Z,&CKSZ1);CHKERRQ(ierr);				/* Recovery checksum1(Z) by Z */
+			  ierr = VecXDot(C2,Z,&CKSZ2);CHKERRQ(ierr);				/* Recovery checksum2(Z) by Z */
+			  ierr = VecXDot(C3,Z,&CKSZ3);CHKERRQ(ierr);				/* Recovery checksum3(Z) by Z */
+			  ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);					/* Recovery scalar beta by Z and R */
+			  PetscPrintf(MPI_COMM_WORLD,"Recovery end.\n");
+			  
+			  /* Recover the calculations from iteration begining to checking */
+			  b = beta/betaold;
+			  ierr = VecAYPX(P,b,Z);CHKERRQ(ierr);    					/*     p <- z + b* p   */	  
+			  CKSP1 = CKSZ1 + b*CKSP1;									/* Update checksum1(P) = checksum1(Z) + b*checksum1(P); */
+			  CKSP2 = CKSZ2 + b*CKSP2;									/* Update checksum2(P) = checksum2(Z) + b*checksum2(P); */
+			  CKSP3 = CKSZ3 + b*CKSP3;									/* Update checksum3(P) = checksum3(Z) + b*checksum3(P); */
+			  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);			/*     w <- Ap         */	/* MVM */
+			  ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);					/*     dpi <- p'w     */	  
+			  ierr = VecXDot(CKSAmat1, P, &CKSW1);CHKERRQ(ierr);
+			  CKSW1 = CKSW1 + d1*CKSP1 + d2*CKSP2 + d3*CKSP3;			/* Update checksum1(W) = checksum1(A)P + d1*checksum1(P) + d2*checksum2(P) + d3*checksum3(P); */
+			  ierr = VecXDot(CKSAmat2, P, &CKSW2);CHKERRQ(ierr);
+			  CKSW2 = CKSW2 + d2*CKSP1 + d3*CKSP2 + d1*CKSP3;			/* Update checksum2(W) = checksum2(A)P + d2*checksum1(P) + d3*checksum2(P) + d1*checksum3(P); */
+			  ierr = VecXDot(CKSAmat3, P, &CKSW3);CHKERRQ(ierr);
+			  CKSW3 = CKSW3 + d3*CKSP1 + d1*CKSP2 + d2*CKSP3;			/* Update checksum3(W) = checksum3(A)P + d3*checksum1(P) + d1*checksum2(P) + d2*checksum3(P); */
+		  }
+		  else{
+			  if (PetscAbsScalar(1.0-(delta2*delta3)/(delta1*delta1)) > 1.0e-6)
+			  {
+			  /* Rollback and Recovery */
+			  PetscPrintf(MPI_COMM_WORLD,"Multiple errors of output vector\n");
+			  PetscPrintf(MPI_COMM_WORLD,"Recovery start...\n");
+			  PetscPrintf(MPI_COMM_WORLD,"Rollback from iteration-%d to iteration-%d\n",i,CKPi);
+			  betaold = CKPbetaold;										/* Recovery scalar betaold by checkpoint*/
+			  i = CKPi;													/* Recovery integer i by checkpoint */
+			  ierr = VecCopy(CKPP,P);CHKERRQ(ierr);						/* Recovery vector P from checkpoint */
+			  ierr = VecXDot(C1,P,&CKSP1);CHKERRQ(ierr);				/* Recovery checksum1(P) by P */	
+			  ierr = VecXDot(C2,P,&CKSP2);CHKERRQ(ierr);				/* Recovery checksum2(P) by P */			  
+			  ierr = VecXDot(C3,P,&CKSP3);CHKERRQ(ierr);				/* Recovery checksum3(P) by P */
+			  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);			/* Recovery vector W by P */
+			  ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);					/* Recovery scalar dpi by P and W */
+			  ierr = VecCopy(CKPX,X);CHKERRQ(ierr);						/* Recovery vector X from checkpoint */
+			  ierr = VecXDot(C1,X,&CKSX1);CHKERRQ(ierr);				/* Recovery checksum1(X) by X */
+			  ierr = VecXDot(C2,X,&CKSX2);CHKERRQ(ierr);				/* Recovery checksum2(X) by X */ 			  
+			  ierr = VecXDot(C3,X,&CKSX3);CHKERRQ(ierr);				/* Recovery checksum3(X) by X */ 			  
+			  ierr = KSP_MatMult(ksp,Amat,X,R);CHKERRQ(ierr);			/* Recovery vector R by X */
+			  ierr = VecAYPX(R,-1.0,B);CHKERRQ(ierr);
+			  ierr = VecXDot(C1,R,&CKSR1);CHKERRQ(ierr);				/* Recovery checksum1(R) by R */
+			  ierr = VecXDot(C2,R,&CKSR2);CHKERRQ(ierr);				/* Recovery checksum2(R) by R */
+			  ierr = VecXDot(C3,R,&CKSR3);CHKERRQ(ierr);				/* Recovery checksum3(R) by R */
+			  ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);				/* Recovery vector Z by R */
+			  ierr = VecXDot(C1,Z,&CKSZ1);CHKERRQ(ierr);				/* Recovery checksum1(Z) by Z */
+			  ierr = VecXDot(C2,Z,&CKSZ2);CHKERRQ(ierr);				/* Recovery checksum2(Z) by Z */
+			  ierr = VecXDot(C3,Z,&CKSZ3);CHKERRQ(ierr);				/* Recovery checksum3(Z) by Z */
+			  ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);					/* Recovery scalar beta by Z and R */
+			  PetscPrintf(MPI_COMM_WORLD,"Recovery end.\n");
+			  
+			  /* Recover the calculations from iteration begining to checking */
+			  b = beta/betaold;
+			  ierr = VecAYPX(P,b,Z);CHKERRQ(ierr);    					/*     p <- z + b* p   */	  
+			  CKSP1 = CKSZ1 + b*CKSP1;									/* Update checksum1(P) = checksum1(Z) + b*checksum1(P); */
+			  CKSP2 = CKSZ2 + b*CKSP2;									/* Update checksum2(P) = checksum2(Z) + b*checksum2(P); */
+			  CKSP3 = CKSZ3 + b*CKSP3;									/* Update checksum3(P) = checksum3(Z) + b*checksum3(P); */
+			  ierr = KSP_MatMult(ksp,Amat,P,W);CHKERRQ(ierr);			/*     w <- Ap         */	/* MVM */
+			  ierr = VecXDot(P,W,&dpi);CHKERRQ(ierr);					/*     dpi <- p'w     */	  
+			  ierr = VecXDot(CKSAmat1, P, &CKSW1);CHKERRQ(ierr);
+			  CKSW1 = CKSW1 + d1*CKSP1 + d2*CKSP2 + d3*CKSP3;			/* Update checksum1(W) = checksum1(A)P + d1*checksum1(P) + d2*checksum2(P) + d3*checksum3(P); */
+			  ierr = VecXDot(CKSAmat2, P, &CKSW2);CHKERRQ(ierr);
+			  CKSW2 = CKSW2 + d2*CKSP1 + d3*CKSP2 + d1*CKSP3;			/* Update checksum2(W) = checksum2(A)P + d2*checksum1(P) + d3*checksum2(P) + d1*checksum3(P); */
+			  ierr = VecXDot(CKSAmat3, P, &CKSW3);CHKERRQ(ierr);
+			  CKSW3 = CKSW3 + d3*CKSP1 + d1*CKSP2 + d2*CKSP3;			/* Update checksum3(W) = checksum3(A)P + d3*checksum1(P) + d1*checksum2(P) + d2*checksum3(P); */			  
+			  }
+			  else{
+				  if (rank == 0) printf ("Locate and correct right away\n");
+				  VecScatter	ctx;
+				  Vec			W_SEQ;
+				  PetscScalar	*W_ARR;
+				  VecScatterCreateToAll(W,&ctx,&W_SEQ);
+				  VecScatterBegin(ctx,W,W_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+				  VecScatterEnd(ctx,W,W_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+				  VecGetArray(W_SEQ,&W_ARR);
+				  pos1	= rint(delta2/delta1) - 1;
+				  v		= W_ARR[pos1];
+				  v		= v - delta1;
+				  ierr	= VecSetValues(W,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+				  PetscPrintf(MPI_COMM_WORLD,"Correct an error in output vector of MVM at iteration-%d\n", i);
+				  VecDestroy(&W_SEQ);
+				  VecScatterDestroy(&ctx);
+			  }
+		  }
+		}
+		/* Dingwen */
+		
+    } else {
+      ierr = VecAYPX(W,beta/betaold,S);CHKERRQ(ierr);                  /*     w <- Ap         */
+      dpi  = delta - beta*beta*dpiold/(betaold*betaold);             /*     dpi <- p'w     */
+	  /* Dingwen */
+	  CKSW1 = beta/betaold*CKSW1 + CKSS1;							/* Update checksum1(W) = checksum1(S) + beta/betaold*checksum1(W); */
+	  CKSW2 = beta/betaold*CKSW2 + CKSS2;							/* Update checksum2(W) = checksum2(S) + beta/betaold*checksum2(W); */
+	  CKSW3 = beta/betaold*CKSW3 + CKSS3;							/* Update checksum3(W) = checksum3(S) + beta/betaold*checksum3(W); */
+	  /* Dingwen */
+	}
+    betaold = beta;
+    KSPCheckDot(ksp,beta);
+
+    if ((dpi == 0.0) || ((i > 0) && (PetscRealPart(dpi*dpiold) <= 0.0))) {
+      ksp->reason = KSP_DIVERGED_INDEFINITE_MAT;
+      ierr        = PetscInfo(ksp,"diverging due to indefinite or negative definite matrix\n");CHKERRQ(ierr);
+      break;
+    }
+    a = beta/dpi;                                 /*     a = beta/p'w   */
+    if (eigs) d[i] = PetscSqrtReal(PetscAbsScalar(b))*e[i] + 1.0/a;
+    ierr = VecAXPY(X,a,P);CHKERRQ(ierr);          /*     x <- x + ap     */
+	/* Dingwen */
+	CKSX1 = CKSX1 + a*CKSP1;									/* Update checksum1(X) = checksum1(X) + a*checksum1(P); */
+	CKSX2 = CKSX2 + a*CKSP2;									/* Update checksum2(X) = checksum2(X) + a*checksum2(P); */
+	CKSX3 = CKSX3 + a*CKSP3;									/* Update checksum3(X) = checksum3(X) + a*checksum3(P); */
+	/* Dingwen */
+    
+	ierr = VecAXPY(R,-a,W);CHKERRQ(ierr);                      /*     r <- r - aw    */
+
+	/* Dingwen */
+	CKSR1 = CKSR1 - a*CKSW1;									/* Update checksum1(R) = checksum1(R) - a*checksum1(W); */
+	CKSR2 = CKSR2 - a*CKSW2;									/* Update checksum2(R) = checksum2(R) - a*checksum2(W); */
+	CKSR3 = CKSR3 - a*CKSW3;									/* Update checksum3(R) = checksum3(R) - a*checksum3(W); */
+	/* Dingwen */
+	
+	if (ksp->normtype == KSP_NORM_PRECONDITIONED && ksp->chknorm < i+2) {      
+	  ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);               /*     z <- Br         */
+	  
+	  /* Dingwen */
+	  ierr = VecXDot(C1,Z, &CKSZ1);CHKERRQ(ierr);				/* Update checksum1(Z) */
+	  ierr = VecXDot(C2,Z, &CKSZ2);CHKERRQ(ierr);				/* Update checksum2(Z) */
+	  ierr = VecXDot(C3,Z, &CKSZ3);CHKERRQ(ierr);				/* Update checksum3(Z) */
+	  /* Dingwen */
+	  
+	  if (cg->singlereduction) {
+        ierr = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);				/* MVM */
+		/* Dingwen */
+		ierr = VecXDot(CKSAmat1, Z, &CKSS1);CHKERRQ(ierr);
+		CKSS1 = CKSS1 + d1*CKSZ1 + d2*CKSZ2 + d3*CKSZ3;						/* Update checksum1(S) = checksum1(A)Z + d1*chekcsum1(Z) + d2*checksum2(Z) + d3*checksum3(Z); */
+		ierr = VecXDot(CKSAmat2, Z, &CKSS2);CHKERRQ(ierr);
+		CKSS2 = CKSS2 + d2*CKSZ1 + d3*CKSZ2 + d1*CKSZ3;						/* Update checksum2(S) = checksum2(A)Z + d2*chekcsum1(Z) + d3*checksum2(Z) + d1*checksum3(Z); */
+		ierr = VecXDot(CKSAmat3, Z, &CKSS3);CHKERRQ(ierr);
+		CKSS3 = CKSS3 + d3*CKSZ1 + d1*CKSZ2 + d2*CKSZ3;						/* Update checksum3(S) = checksum3(A)Z + d3*chekcsum1(Z) + d1*checksum2(Z) + d2*checksum3(Z); */
+
+		/* Dingwen */
+      }
+      ierr = VecNorm(Z,NORM_2,&dp);CHKERRQ(ierr);              /*    dp <- z'*z       */
+    } else if (ksp->normtype == KSP_NORM_UNPRECONDITIONED && ksp->chknorm < i+2) {
+      ierr = VecNorm(R,NORM_2,&dp);CHKERRQ(ierr);              /*    dp <- r'*r       */
+    } else if (ksp->normtype == KSP_NORM_NATURAL) {
+      ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);               /*     z <- Br         */
+ 	  
+	  /* Dingwen */
+	  ierr = VecXDot(C1,Z, &CKSZ1);CHKERRQ(ierr);				/* Update checksum1(Z) */
+	  ierr = VecXDot(C2,Z, &CKSZ2);CHKERRQ(ierr);				/* Update checksum2(Z) */
+	  ierr = VecXDot(C3,Z, &CKSZ3);CHKERRQ(ierr);				/* Update checksum3(Z) */	  
+	  /* Dingwen */
+	  
+	  if (cg->singlereduction) {
+        PetscScalar tmp[2];
+        Vec         vecs[2];
+        vecs[0] = S; vecs[1] = R;
+        ierr    = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);
+        ierr  = VecMDot(Z,2,vecs,tmp);CHKERRQ(ierr);
+        delta = tmp[0]; beta = tmp[1];
+      } else {
+        ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);     /*  beta <- r'*z       */
+      }
+      KSPCheckDot(ksp,beta);
+      dp = PetscSqrtReal(PetscAbsScalar(beta));
+    } else {
+      dp = 0.0;
+    }
+	  
+    ksp->rnorm = dp;
+    CHKERRQ(ierr);KSPLogResidualHistory(ksp,dp);CHKERRQ(ierr);
+    ierr = KSPMonitor(ksp,i+1,dp);CHKERRQ(ierr);
+    ierr = (*ksp->converged)(ksp,i+1,dp,&ksp->reason,ksp->cnvP);CHKERRQ(ierr);
+    if (ksp->reason) break;
+
+    if ((ksp->normtype != KSP_NORM_PRECONDITIONED && (ksp->normtype != KSP_NORM_NATURAL)) || (ksp->chknorm >= i+2)) {
+      ierr = KSP_PCApply(ksp,R,Z);CHKERRQ(ierr);                   /*     z <- Br         */
+	  
+	  /* Dingwen */
+	  ierr = VecXDot(C1,Z, &CKSZ1);CHKERRQ(ierr);				/* Update checksum1(Z) */
+	  ierr = VecXDot(C2,Z, &CKSZ2);CHKERRQ(ierr);				/* Update checksum2(Z) */ 
+	  ierr = VecXDot(C3,Z, &CKSZ3);CHKERRQ(ierr);				/* Update checksum3(Z) */ 
+	  /* Dingwen */
+      
+	  if (cg->singlereduction) {
+        ierr = KSP_MatMult(ksp,Amat,Z,S);CHKERRQ(ierr);
+      }
+    }
+		  
+    if ((ksp->normtype != KSP_NORM_NATURAL) || (ksp->chknorm >= i+2)) {
+      if (cg->singlereduction) {
+        PetscScalar tmp[2];
+        Vec         vecs[2];
+        vecs[0] = S; vecs[1] = R;
+        ierr  = VecMDot(Z,2,vecs,tmp);CHKERRQ(ierr);
+        delta = tmp[0]; beta = tmp[1];
+      } else {
+        ierr = VecXDot(Z,R,&beta);CHKERRQ(ierr);        /*  beta <- z'*r       */
+      }
+      KSPCheckDot(ksp,beta);
+    }
+	
+    i++;
+	
+	/* Dingwen */
+	/* Inject an error in P */
+		  if((i==inj_itr)&&(flag3)&&(error_type==3))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			P_SEQ;
+		  PetscScalar	*P_ARR;
+		  VecScatterCreateToAll(P,&ctx,&P_SEQ);
+		  VecScatterBegin(ctx,P,P_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,P,P_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(P_SEQ,&P_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= P_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(P,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&P_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(P);
+		  VecAssemblyEnd(P);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject an error in P of position-%d at the end of iteration-%d\n", pos1,i);
+		  flag3	= PETSC_FALSE;
+	  }
+	  
+	  /* Inject two errors in P */
+	  if((i==inj_itr)&&(flag4)&(error_type==4))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			P_SEQ;
+		  PetscScalar	*P_ARR;
+		  VecScatterCreateToAll(P,&ctx,&P_SEQ);
+		  VecScatterBegin(ctx,P,P_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,P,P_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(P_SEQ,&P_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= P_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(P,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  pos2 = rand()/(RAND_MAX/n+1);
+		  v		= P_ARR[pos2]*inj_times;
+		  ierr	= VecSetValues(P,1,&pos2,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&P_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(P);
+		  VecAssemblyEnd(P);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject two errors in P of position-%d and position-%d at the end of iteration-%d\n", pos1,pos2,i);
+		  flag4	= PETSC_FALSE;
+		}
+		
+		/* Inject an error in X*/
+	  if((i==inj_itr)&&(flag5)&&(error_type==5))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			X_SEQ;
+		  PetscScalar	*X_ARR;
+		  VecScatterCreateToAll(X,&ctx,&X_SEQ);
+		  VecScatterBegin(ctx,X,X_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,X,X_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(X_SEQ,&X_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= X_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(X,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&X_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(X);
+		  VecAssemblyEnd(X);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject an error in X of position-%d at the end of iteration-%d\n", pos1,i);
+		  flag5	= PETSC_FALSE;
+	  }
+	  
+	  /* Inject two errors in X*/
+	  if((i==inj_itr)&&(flag6)&&(error_type==6))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			X_SEQ;
+		  PetscScalar	*X_ARR;
+		  VecScatterCreateToAll(X,&ctx,&X_SEQ);
+		  VecScatterBegin(ctx,X,X_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,X,X_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(X_SEQ,&X_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= X_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(X,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  pos2 = rand()/(RAND_MAX/n+1);
+		  v		= X_ARR[pos2]*inj_times;
+		  ierr	= VecSetValues(X,1,&pos2,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&X_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(X);
+		  VecAssemblyEnd(X);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject two errors in X of position-%d and position-%d at the end of iteration-%d\n", pos1,pos2,i);
+		  flag6	= PETSC_FALSE;
+		}
+		
+		/* Inject an error in R */
+	  if((i==inj_itr)&&(flag7)&&(error_type==7))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			R_SEQ;
+		  PetscScalar	*R_ARR;
+		  VecScatterCreateToAll(R,&ctx,&R_SEQ);
+		  VecScatterBegin(ctx,R,R_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,R,R_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(R_SEQ,&R_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= R_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(R,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&R_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(R);
+		  VecAssemblyEnd(R);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject an error in R of position-%d at the end of iteration-%d\n", pos1,i);
+		  flag7	= PETSC_FALSE;
+	  }
+	  
+	  /* Inject two errors */
+	  if((i==inj_itr)&&(flag8)&&(error_type==8))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			R_SEQ;
+		  PetscScalar	*R_ARR;
+		  VecScatterCreateToAll(R,&ctx,&R_SEQ);
+		  VecScatterBegin(ctx,R,R_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,R,R_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(R_SEQ,&R_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= R_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(R,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  pos2 = rand()/(RAND_MAX/n+1);
+		  v		= R_ARR[pos2]*inj_times;
+		  ierr	= VecSetValues(R,1,&pos2,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&R_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(R);
+		  VecAssemblyEnd(R);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject two errors in R of position-%d and position-%d at the end of iteration-%d\n", pos1,pos2,i);
+		  flag8	= PETSC_FALSE;
+		}
+		
+		/* Inject an error in Z */
+	  if((i==inj_itr)&&(flag9)&&(error_type==9))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			Z_SEQ;
+		  PetscScalar	*Z_ARR;
+		  VecScatterCreateToAll(Z,&ctx,&Z_SEQ);
+		  VecScatterBegin(ctx,Z,Z_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,Z,Z_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(Z_SEQ,&Z_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= Z_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(Z,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&Z_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(Z);
+		  VecAssemblyEnd(Z);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject an error in Z of position-%d at the end of iteration-%d\n", pos1,i);
+		  flag9	= PETSC_FALSE;
+	  }
+	  
+	  /* Inject two errors */
+	  if((i==inj_itr)&&(flag10)&&(error_type==10))
+	  {
+		  srand (time(NULL));
+		  VecScatter	ctx;
+		  Vec			Z_SEQ;
+		  PetscScalar	*Z_ARR;
+		  VecScatterCreateToAll(Z,&ctx,&Z_SEQ);
+		  VecScatterBegin(ctx,Z,Z_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecScatterEnd(ctx,Z,Z_SEQ,INSERT_VALUES,SCATTER_FORWARD);
+		  VecGetArray(Z_SEQ,&Z_ARR);
+		  pos1 = rand()/(RAND_MAX/n+1);
+		  v		= Z_ARR[pos1]*inj_times;
+		  ierr	= VecSetValues(Z,1,&pos1,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  pos2 = rand()/(RAND_MAX/n+1);
+		  v		= Z_ARR[pos2]*inj_times;
+		  ierr	= VecSetValues(Z,1,&pos2,&v,INSERT_VALUES);CHKERRQ(ierr);
+		  VecDestroy(&Z_SEQ);
+		  VecScatterDestroy(&ctx);
+		  VecAssemblyBegin(Z);
+		  VecAssemblyEnd(Z);
+		  PetscPrintf(MPI_COMM_WORLD,"Inject two errors in Z of position-%d and position-%d at the end of iteration-%d\n", pos1,pos2,i);
+		  flag10	= PETSC_FALSE;
+		}
 	/* Dingwen */
 	
   } while (i<ksp->max_it);
   /* Dingwen */
-  ierr = VecXDot(C1,X,&sumX);CHKERRQ(ierr);
-  ierr = VecXDot(C1,R,&sumR);CHKERRQ(ierr);
-  printf ("sum of X = %f\n", sumX);
-  printf ("checksum(X) = %f\n", CKSX);
-  printf ("sum of R = %f\n", sumR);
-  printf ("checksum(R) = %f\n", CKSR);
-  /* Dingwen */
+  clock_gettime(CLOCK_REALTIME, &end);
+  local_diff = 1000000000L*(end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec);
+  MPI_Reduce(&local_diff, &global_diff, 1, MPI_LONG_LONG_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+  PetscPrintf(MPI_COMM_WORLD,"elapsed time of main loop = %lf nanoseconds\n", (double)(global_diff)/size);
+  PetscPrintf(MPI_COMM_WORLD,"Number of iterations without rollback = %d\n", i+1);
+  }
+  
   if (i >= ksp->max_it) ksp->reason = KSP_DIVERGED_ITS;
   if (eigs) cg->ned = ksp->its;
   PetscFunctionReturn(0);
@@ -600,7 +2410,3 @@ PETSC_EXTERN PetscErrorCode KSPCreate_CG(KSP ksp)
   ierr = PetscObjectComposeFunction((PetscObject)ksp,"KSPCGUseSingleReduction_C",KSPCGUseSingleReduction_CG);CHKERRQ(ierr);
   PetscFunctionReturn(0);
 }
-
-
-
-
